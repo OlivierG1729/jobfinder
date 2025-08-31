@@ -207,9 +207,7 @@ def search_offers(query: Optional[str] = None, page_size: int = 50, page: int = 
 
     # 3) Tri local par date décroissante si on a la colonne de date
     if COLUMN_DATE:
-        def get_date(r: Dict[str, Any]):
-            return r.get(COLUMN_DATE)
-        rows.sort(key=get_date, reverse=True)
+        rows.sort(key=lambda r: r.get(COLUMN_DATE) or "", reverse=True)
 
     return rows
 
