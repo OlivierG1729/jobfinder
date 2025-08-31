@@ -188,30 +188,53 @@ def extract_url(off: dict) -> Optional[str]:
 def _has_spaces(s: Optional[str]) -> bool:
     return bool(s) and (" " in s)
 
-def search_offers(query: Optional[str] = None, page_size: int = 50, page: int = 1) -> List[Dict[str, Any]]:
+def search_offers(
+    query: Optional[str] = None,
+    page_size: int = 50,
+    page: int = 1,
+    max_pages: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     Version sûre : aucun tri/filtre côté API (évite les 400 si colonnes avec espaces).
-    On récupère les lignes brutes puis on filtre/Trie en Python.
-    Les paramètres ``page_size`` et ``page`` permettent de contrôler la pagination.
+    On récupère les lignes brutes page par page puis on filtre/Trie en Python.
+    ``page_size`` et ``page`` contrôlent la pagination, ``max_pages`` limite
+    le nombre de pages récupérées. Si ``query`` est fourni, on s'arrête dès qu'un
+    résultat correspondant est trouvé.
     """
-    # 1) Récupération brute (sans __sort / __contains)
-    params = {"page_size": page_size, "page": page}
-    data = _api_get(params)
-    rows: List[Dict[str, Any]] = data.get("data", [])
+    aggregated: List[Dict[str, Any]] = []
+    pages_fetched = 0
 
-    # 2) Filtre local (titre) si query
-    if query:
-        qlow = query.lower()
-        def keep(row: Dict[str, Any]) -> bool:
-            t = extract_title(row)
-            return (t is not None) and (qlow in str(t).lower())
-        rows = list(filter(keep, rows))
+    while True:
+        if max_pages is not None and pages_fetched >= max_pages:
+            break
 
-    # 3) Tri local par date décroissante si on a la colonne de date
+        params = {"page_size": page_size, "page": page}
+        data = _api_get(params)
+        rows: List[Dict[str, Any]] = data.get("data", [])
+        if not rows:
+            break
+
+        if query:
+            qlow = query.lower()
+
+            def keep(row: Dict[str, Any]) -> bool:
+                t = extract_title(row)
+                return (t is not None) and (qlow in str(t).lower())
+
+            rows = list(filter(keep, rows))
+
+        aggregated.extend(rows)
+
+        if query and aggregated:
+            break
+
+        page += 1
+        pages_fetched += 1
+
     if COLUMN_DATE:
-        rows.sort(key=lambda r: r.get(COLUMN_DATE) or "", reverse=True)
+        aggregated.sort(key=lambda r: r.get(COLUMN_DATE) or "", reverse=True)
 
-    return rows
+    return aggregated
 
 
 # ----------------------------
