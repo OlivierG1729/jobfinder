@@ -192,9 +192,11 @@ def search_offers(query: Optional[str] = None, page_size: int = 50, page: int = 
     """
     Version sûre : aucun tri/filtre côté API (évite les 400 si colonnes avec espaces).
     On récupère les lignes brutes puis on filtre/Trie en Python.
+    Les paramètres ``page_size`` et ``page`` permettent de contrôler la pagination.
     """
     # 1) Récupération brute (sans __sort / __contains)
-    data = _api_get({"page_size": page_size, "page": page})
+    params = {"page_size": page_size, "page": page}
+    data = _api_get(params)
     rows: List[Dict[str, Any]] = data.get("data", [])
 
     # 2) Filtre local (titre) si query
