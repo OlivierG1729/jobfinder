@@ -1,0 +1,10 @@
+# Fichiers sensibles
+.env
+
+# Dossiers temporaires
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.env/
