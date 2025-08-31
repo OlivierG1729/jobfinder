@@ -20,15 +20,16 @@ if submitted:
             json={"q": q, "page_size": page_size},
             timeout=30,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            st.error(resp.json().get("detail", "Erreur inconnue"))
         data = resp.json()["items"]
 
         st.success(f"{len(data)} résultat(s) trouvé(s)")
 
         for item in data:
             st.markdown(
-                f"""**{item['title']}**  
-                {item.get('date') or ''}  
+                f"""**{item['title']}**
+                {item.get('date') or ''}
                 {item.get('url') or ''}"""
             )
 
@@ -53,7 +54,8 @@ if saved:
             json={"q": q2, "email": email or None},
             timeout=30,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            st.error(resp.json().get("detail", "Erreur inconnue"))
         st.success("Recherche sauvegardée !")
     except Exception as e:
         st.error(str(e))
