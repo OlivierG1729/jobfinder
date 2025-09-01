@@ -1,231 +1,136 @@
 # backend/service.py
+"""Utilities for interacting with the Choisir le Service Public API."""
+
 from __future__ import annotations
 
-import os
 from typing import Optional, List, Dict, Any
-from pathlib import Path
+from datetime import datetime
 
 import requests
 
-# ----------------------------
-# Chargement .env (RID, overrides colonnes)
-# ----------------------------
-try:
-    from dotenv import load_dotenv  # type: ignore
-    ROOT = Path(__file__).resolve().parents[1]  # .../JobFinder
-    ENV_PATH = ROOT / ".env"
-    load_dotenv(dotenv_path=ENV_PATH, override=True)
-except Exception:
-    pass
+# ---------------------------------------------------------------------------
+# Official Choisir le Service Public API
+# ---------------------------------------------------------------------------
+
+# Public search endpoint for job offers.  This replaces the previous
+# Tabular API based implementation which required a resource identifier (RID).
+# The official API exposes a fixed schema so dynamic discovery of columns is no
+# longer necessary.
+
+BASE = "https://choisirleservicepublic.gouv.fr/api/offres"
+
+# Some debug endpoints in ``main.py`` expect a ``PROFILE`` constant and a low
+# level ``_api_get`` function.  They are kept here for backward compatibility
+# but simply point to the same search endpoint.
+PROFILE = BASE
 
 
-
-
-
-
-
-RID = os.getenv("RID")
-if not RID:
-    raise RuntimeError(
-        "RID non défini. Créez un fichier .env à la racine et renseignez RID=<uuid_de_ressource_DataGouv>."
-    )
-
-BASE = f"https://tabular-api.data.gouv.fr/api/resources/{RID}/data/"
-PROFILE = f"https://tabular-api.data.gouv.fr/api/resources/{RID}/profile/"
-
-# Overrides manuels (facultatifs) – à poser dans .env si l’auto-détection échoue
-ENV_TITLE = os.getenv("TITLE_KEY")
-ENV_DATE = os.getenv("DATE_KEY")
-ENV_URL = os.getenv("URL_KEY")
-ENV_ID = os.getenv("ID_KEY")
-
-# Candidats par défaut si pas d’override
-TITLE_CANDIDATES = ["intitule", "intitulé", "intitulé du poste", "intitulé_du_poste", "titre", "title", "intitulé du poste"]
-DATE_CANDIDATES = [
-    "datePublication",
-    "date_publication",
-    "date de première publication",
-    "date_de_premiere_publication",
-    "publication_date",
-    "date",
-    "date de début de publication par défaut",
-]
-URL_CANDIDATES = ["url", "lien", "link"]
-ID_CANDIDATES = ["id", "__id", "_id", "identifiant", "offer_id"]
-
-# ----------------------------
-# Découverte du schéma (profile)
-# ----------------------------
-_profile_cache: Optional[Dict[str, Any]] = None
-_field_names: set[str] = set()
-
-def _fetch_profile() -> Dict[str, Any]:
-    """Récupère et met en cache le profil (schéma) de la ressource."""
-    global _profile_cache, _field_names
-    if _profile_cache is not None:
-        return _profile_cache
-    r = requests.get(PROFILE, timeout=30)
-    r.raise_for_status()
-    prof = r.json()
-
-    fields = []
-    if isinstance(prof, dict):
-        schema = prof.get("schema")
-        if isinstance(schema, dict) and "fields" in schema:
-            fields = schema["fields"]
-        elif "fields" in prof:
-            fields = prof["fields"]
-
-    names: set[str] = set()
-    for f in fields or []:
-        if isinstance(f, dict) and "name" in f:
-            names.add(str(f["name"]))
-        elif isinstance(f, str):
-            names.add(f)
-    _field_names = names
-    _profile_cache = prof
-    return prof
-
-def _has_field(name: Optional[str]) -> bool:
-    if not name:
-        return False
-    if not _field_names:
-        _fetch_profile()
-    return name in _field_names
-
-def _pick_existing(candidates: List[str]) -> Optional[str]:
-    if not _field_names:
-        _fetch_profile()
-    # On compare en insensible à la casse / espaces
-    lowered = {k.lower(): k for k in _field_names}
-    for cand in candidates:
-        key_norm = cand.lower()
-        if key_norm in lowered:
-            return lowered[key_norm]
-        # Gestion champs avec espaces/accents : on tente un contains grossier
-        for k in lowered:
-            if key_norm.replace(" ", "") in k.replace(" ", ""):
-                return lowered[k]
-    return None
-
-# Choix finaux des colonnes : priorité aux overrides, sinon auto-pick
-COLUMN_ID: Optional[str] = ENV_ID if ENV_ID else _pick_existing(ID_CANDIDATES)
-COLUMN_TITLE: Optional[str] = ENV_TITLE if ENV_TITLE else _pick_existing(TITLE_CANDIDATES)
-COLUMN_DATE: Optional[str] = ENV_DATE if ENV_DATE else _pick_existing(DATE_CANDIDATES)
-COLUMN_URL: Optional[str] = ENV_URL if ENV_URL else _pick_existing(URL_CANDIDATES)
-
-# ----------------------------
-# Appels API bas niveau
-# ----------------------------
 def _api_get(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Low level helper around ``requests.get``.
+
+    Parameters are forwarded to the Choisir le Service Public API and the JSON
+    response is returned.  An exception is raised if the request fails.
+    """
+
     r = requests.get(BASE, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
-# ----------------------------
-# Helpers extraction robustes
-# ----------------------------
-def _find_key_like(d: dict, *needles: str) -> Optional[str]:
-    """Retourne la clé dont le nom contient tous les fragments `needles` (insensible casse/espaces/accents simples)."""
-    def norm(s: str) -> str:
-        return s.lower().replace(" ", "").replace("é", "e").replace("è", "e").replace("ê", "e")
-    keys = list(d.keys())
-    for k in keys:
-        name = norm(str(k))
-        if all(norm(n) in name for n in needles):
-            return k
+
+# ---------------------------------------------------------------------------
+# Field extraction helpers
+# ---------------------------------------------------------------------------
+
+def extract_offer_id(off: Dict[str, Any]) -> Optional[str]:
+    """Best effort extraction of an offer identifier."""
+
+    for key in ("id", "_id", "offer_id"):
+        if key in off and off[key] is not None:
+            return str(off[key])
     return None
 
-def extract_offer_id(off: dict) -> Optional[str]:
-    if COLUMN_ID and COLUMN_ID in off and off[COLUMN_ID] is not None:
-        return str(off[COLUMN_ID])
-    k = _find_key_like(off, "id")
-    if k and off.get(k) is not None:
-        return str(off[k])
-    for k in ID_CANDIDATES:
-        if k in off and off[k] is not None:
-            return str(off[k])
-    return None
 
-def extract_title(off: dict) -> str:
-    if COLUMN_TITLE and COLUMN_TITLE in off and off[COLUMN_TITLE]:
-        return str(off[COLUMN_TITLE])
-    for patt in [("intitul",), ("titre",), ("title",)]:
-        k = _find_key_like(off, *patt)
-        if k and off.get(k):
-            return str(off[k])
-    # fallback : première valeur texte non-URL
-    for k, v in off.items():
-        if isinstance(v, str) and v.strip() and not v.startswith(("http://", "https://")):
-            return v.strip()
+def extract_title(off: Dict[str, Any]) -> str:
+    """Extracts a human readable title for the offer."""
+
+    for key in ("intitule", "intitulé", "titre", "title"):
+        val = off.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # Fallback: first non-empty string that does not look like a URL
+    for val in off.values():
+        if isinstance(val, str) and val.strip() and not val.startswith(("http://", "https://")):
+            return val.strip()
     return "Offre"
 
-def extract_date(off: dict) -> Optional[str]:
-    if COLUMN_DATE and COLUMN_DATE in off:
-        return off.get(COLUMN_DATE)
-    for patt in [("date", "premiere", "publication"), ("date", "publi"), ("publication",), ("date",)]:
-        k = _find_key_like(off, *patt)
-        if k:
-            return off.get(k)
+
+def extract_date(off: Dict[str, Any]) -> Optional[str]:
+    """Returns the publication date as a string if available."""
+
+    for key in ("datePublication", "date_publication", "publication_date", "date"):
+        val = off.get(key)
+        if isinstance(val, str) and val:
+            return val
     return None
 
-def extract_url(off: dict) -> Optional[str]:
-    # Si une colonne URL existe réellement
-    if COLUMN_URL and COLUMN_URL in off:
-        return off.get(COLUMN_URL)
-    # Sinon, reconstruire depuis l'_id si présent (l’URL publique de la fiche CSP)
-    if "_id" in off and off.get("_id"):
-        return f"https://choisirleservicepublic.gouv.fr/offre/{off['_id']}"
-    # Fallback : première valeur qui ressemble à une URL
-    for k, v in off.items():
-        if isinstance(v, str) and v.startswith(("http://", "https://")):
-            return v
+
+def extract_url(off: Dict[str, Any]) -> Optional[str]:
+    """Returns a URL pointing to the public offer page."""
+
+    for key in ("url", "lien", "link"):
+        val = off.get(key)
+        if isinstance(val, str) and val:
+            return val
+
+    oid = extract_offer_id(off)
+    if oid:
+        return f"https://choisirleservicepublic.gouv.fr/offre/{oid}"
     return None
 
-# ----------------------------
-# Recherche (avec contournement des champs à espaces)
-# ----------------------------
-def _has_spaces(s: Optional[str]) -> bool:
-    return bool(s) and (" " in s)
 
-
+# ---------------------------------------------------------------------------
+# Search API
+# ---------------------------------------------------------------------------
 
 def search_offers(
     query: Optional[str] = None,
     page_size: int = 50,
     page: int = 1,
 ) -> List[Dict[str, Any]]:
-    params = {"page_size": page_size, "page": page}
+    """Searches job offers through the official API.
+
+    ``query`` is passed via the ``q`` parameter which is what the website uses.
+    The response contains a list of offers under the ``results`` key.  The
+    offers are sorted by publication date in **reverse chronological order**
+    (newest first) before being returned.
+    """
+
+    params: Dict[str, Any] = {"limit": page_size, "page": page}
     if query:
-        params["__contains"] = query         # filtrage côté Tabular API
+        params["q"] = query
 
     data = _api_get(params)
-    rows: List[Dict[str, Any]] = data.get("data", [])
+    offers: List[Dict[str, Any]] = data.get("results") or data.get("data") or []
 
-    # (Filtre Python optionnel, à garder si la ressource ne supporte pas __contains)
-    # if query:
-    #     qlow = query.lower()
-    #     rows = [r for r in rows if qlow in extract_title(r).lower()]
+    def parse_date(off: Dict[str, Any]) -> datetime:
+        d = extract_date(off)
+        if not d:
+            return datetime.min
+        try:
+            # ``datetime.fromisoformat`` does not accept ``Z`` so we normalise
+            # to an explicit UTC offset.
+            return datetime.fromisoformat(d.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min
 
-    if COLUMN_DATE:
-        rows.sort(key=lambda r: r.get(COLUMN_DATE) or "", reverse=True)
-    return rows
+    # Newest first
+    offers.sort(key=parse_date, reverse=True)
+    return offers
 
 
-# ----------------------------
-# Debug helper pour /debug/schema
-# ----------------------------
 def get_detected_columns() -> Dict[str, Any]:
-    return {
-        "COLUMN_ID": COLUMN_ID,
-        "COLUMN_TITLE": COLUMN_TITLE,
-        "COLUMN_DATE": COLUMN_DATE,
-        "COLUMN_URL": COLUMN_URL,
-        "known_fields": sorted(_field_names) if _field_names else [],
-        "ENV": {
-            "ID_KEY": ENV_ID,
-            "TITLE_KEY": ENV_TITLE,
-            "DATE_KEY": ENV_DATE,
-            "URL_KEY": ENV_URL,
-        },
-    }
+    """Backward compatibility stub used by debug endpoints."""
+
+    return {}
+
