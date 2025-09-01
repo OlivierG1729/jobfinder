@@ -1,231 +1,315 @@
 # backend/service.py
+"""Recherche CSP par scraping des pages publiques (parité maximale avec le site).
+Stratégie :
+- On lit les pages HTML publiques :
+  https://choisirleservicepublic.gouv.fr/nos-offres/filtres/mot-cles/<query>/page/N/
+- On PARCOURT les pages 1, 2, 3, ... jusqu’à cumuler AU MOINS page*page_size éléments.
+- On renvoie la tranche demandée [start:end], triée par date décroissante.
+- On expose aussi un total estimé si détectable.
+Un fallback AJAX est gardé en dernier recours, mais n’est pas utilisé pour paginer.
+"""
+
 from __future__ import annotations
 
 import os
-from typing import Optional, List, Dict, Any
-from pathlib import Path
+import json
+import re
+from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, timezone
 
 import requests
+from bs4 import BeautifulSoup
+import dateparser
 
-# ----------------------------
-# Chargement .env (RID, overrides colonnes)
-# ----------------------------
-try:
-    from dotenv import load_dotenv  # type: ignore
-    ROOT = Path(__file__).resolve().parents[1]  # .../JobFinder
-    ENV_PATH = ROOT / ".env"
-    load_dotenv(dotenv_path=ENV_PATH, override=True)
-except Exception:
-    pass
+# ------------------ Config ------------------
 
+SITE_BASE = "https://choisirleservicepublic.gouv.fr"
+LIST_BASE = f"{SITE_BASE}/nos-offres/filtres/mot-cles"
+SEARCH_MODE = os.getenv("SEARCH_MODE", "html").lower()  # html|ajax|auto
 
+_session = requests.Session()
+DEFAULT_HEADERS = {
+    "User-Agent": "JobFinder/1.0",
+    "Referer": f"{SITE_BASE}/nos-offres/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
+# ------------------ Utilitaires ------------------
 
+def _parse_any_iso(dt_str: Optional[str]) -> datetime:
+    if not dt_str:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    s = dt_str.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            dt = dateparser.parse(s, languages=["fr", "en"])
+            if dt is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
 
-
-
-RID = os.getenv("RID")
-if not RID:
-    raise RuntimeError(
-        "RID non défini. Créez un fichier .env à la racine et renseignez RID=<uuid_de_ressource_DataGouv>."
-    )
-
-BASE = f"https://tabular-api.data.gouv.fr/api/resources/{RID}/data/"
-PROFILE = f"https://tabular-api.data.gouv.fr/api/resources/{RID}/profile/"
-
-# Overrides manuels (facultatifs) – à poser dans .env si l’auto-détection échoue
-ENV_TITLE = os.getenv("TITLE_KEY")
-ENV_DATE = os.getenv("DATE_KEY")
-ENV_URL = os.getenv("URL_KEY")
-ENV_ID = os.getenv("ID_KEY")
-
-# Candidats par défaut si pas d’override
-TITLE_CANDIDATES = ["intitule", "intitulé", "intitulé du poste", "intitulé_du_poste", "titre", "title", "intitulé du poste"]
-DATE_CANDIDATES = [
-    "datePublication",
-    "date_publication",
-    "date de première publication",
-    "date_de_premiere_publication",
-    "publication_date",
-    "date",
-    "date de début de publication par défaut",
-]
-URL_CANDIDATES = ["url", "lien", "link"]
-ID_CANDIDATES = ["id", "__id", "_id", "identifiant", "offer_id"]
-
-# ----------------------------
-# Découverte du schéma (profile)
-# ----------------------------
-_profile_cache: Optional[Dict[str, Any]] = None
-_field_names: set[str] = set()
-
-def _fetch_profile() -> Dict[str, Any]:
-    """Récupère et met en cache le profil (schéma) de la ressource."""
-    global _profile_cache, _field_names
-    if _profile_cache is not None:
-        return _profile_cache
-    r = requests.get(PROFILE, timeout=30)
-    r.raise_for_status()
-    prof = r.json()
-
-    fields = []
-    if isinstance(prof, dict):
-        schema = prof.get("schema")
-        if isinstance(schema, dict) and "fields" in schema:
-            fields = schema["fields"]
-        elif "fields" in prof:
-            fields = prof["fields"]
-
-    names: set[str] = set()
-    for f in fields or []:
-        if isinstance(f, dict) and "name" in f:
-            names.add(str(f["name"]))
-        elif isinstance(f, str):
-            names.add(f)
-    _field_names = names
-    _profile_cache = prof
-    return prof
-
-def _has_field(name: Optional[str]) -> bool:
-    if not name:
-        return False
-    if not _field_names:
-        _fetch_profile()
-    return name in _field_names
-
-def _pick_existing(candidates: List[str]) -> Optional[str]:
-    if not _field_names:
-        _fetch_profile()
-    # On compare en insensible à la casse / espaces
-    lowered = {k.lower(): k for k in _field_names}
-    for cand in candidates:
-        key_norm = cand.lower()
-        if key_norm in lowered:
-            return lowered[key_norm]
-        # Gestion champs avec espaces/accents : on tente un contains grossier
-        for k in lowered:
-            if key_norm.replace(" ", "") in k.replace(" ", ""):
-                return lowered[k]
+def extract_offer_id(off: Dict[str, Any]) -> Optional[str]:
+    for key in ("id", "_id", "offer_id", "reference", "ref"):
+        val = off.get(key)
+        if val is not None:
+            return str(val)
     return None
 
-# Choix finaux des colonnes : priorité aux overrides, sinon auto-pick
-COLUMN_ID: Optional[str] = ENV_ID if ENV_ID else _pick_existing(ID_CANDIDATES)
-COLUMN_TITLE: Optional[str] = ENV_TITLE if ENV_TITLE else _pick_existing(TITLE_CANDIDATES)
-COLUMN_DATE: Optional[str] = ENV_DATE if ENV_DATE else _pick_existing(DATE_CANDIDATES)
-COLUMN_URL: Optional[str] = ENV_URL if ENV_URL else _pick_existing(URL_CANDIDATES)
-
-# ----------------------------
-# Appels API bas niveau
-# ----------------------------
-def _api_get(params: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.get(BASE, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-# ----------------------------
-# Helpers extraction robustes
-# ----------------------------
-def _find_key_like(d: dict, *needles: str) -> Optional[str]:
-    """Retourne la clé dont le nom contient tous les fragments `needles` (insensible casse/espaces/accents simples)."""
-    def norm(s: str) -> str:
-        return s.lower().replace(" ", "").replace("é", "e").replace("è", "e").replace("ê", "e")
-    keys = list(d.keys())
-    for k in keys:
-        name = norm(str(k))
-        if all(norm(n) in name for n in needles):
-            return k
-    return None
-
-def extract_offer_id(off: dict) -> Optional[str]:
-    if COLUMN_ID and COLUMN_ID in off and off[COLUMN_ID] is not None:
-        return str(off[COLUMN_ID])
-    k = _find_key_like(off, "id")
-    if k and off.get(k) is not None:
-        return str(off[k])
-    for k in ID_CANDIDATES:
-        if k in off and off[k] is not None:
-            return str(off[k])
-    return None
-
-def extract_title(off: dict) -> str:
-    if COLUMN_TITLE and COLUMN_TITLE in off and off[COLUMN_TITLE]:
-        return str(off[COLUMN_TITLE])
-    for patt in [("intitul",), ("titre",), ("title",)]:
-        k = _find_key_like(off, *patt)
-        if k and off.get(k):
-            return str(off[k])
-    # fallback : première valeur texte non-URL
-    for k, v in off.items():
-        if isinstance(v, str) and v.strip() and not v.startswith(("http://", "https://")):
-            return v.strip()
+def extract_title(off: Dict[str, Any]) -> str:
+    for key in ("intitule", "intitulé", "titre", "title", "intituleOffre"):
+        val = off.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    for val in off.values():
+        if isinstance(val, str) and val.strip() and not val.startswith(("http://", "https://")):
+            return val.strip()
     return "Offre"
 
-def extract_date(off: dict) -> Optional[str]:
-    if COLUMN_DATE and COLUMN_DATE in off:
-        return off.get(COLUMN_DATE)
-    for patt in [("date", "premiere", "publication"), ("date", "publi"), ("publication",), ("date",)]:
-        k = _find_key_like(off, *patt)
-        if k:
-            return off.get(k)
+def extract_date(off: Dict[str, Any]) -> Optional[str]:
+    for key in ("datePublication", "date_publication", "publication_date", "date",
+                "dateEnLigne", "published_at", "createdAt"):
+        val = off.get(key)
+        if isinstance(val, str) and val:
+            return val
     return None
 
-def extract_url(off: dict) -> Optional[str]:
-    # Si une colonne URL existe réellement
-    if COLUMN_URL and COLUMN_URL in off:
-        return off.get(COLUMN_URL)
-    # Sinon, reconstruire depuis l'_id si présent (l’URL publique de la fiche CSP)
-    if "_id" in off and off.get("_id"):
-        return f"https://choisirleservicepublic.gouv.fr/offre/{off['_id']}"
-    # Fallback : première valeur qui ressemble à une URL
-    for k, v in off.items():
-        if isinstance(v, str) and v.startswith(("http://", "https://")):
-            return v
+def extract_url(off: Dict[str, Any]) -> Optional[str]:
+    for key in ("url", "lien", "link", "apply_url"):
+        val = off.get(key)
+        if isinstance(val, str) and val:
+            return val
+    oid = extract_offer_id(off)
+    if oid:
+        return f"{SITE_BASE}/offre-emploi/{oid}/"
     return None
 
-# ----------------------------
-# Recherche (avec contournement des champs à espaces)
-# ----------------------------
-def _has_spaces(s: Optional[str]) -> bool:
-    return bool(s) and (" " in s)
+# ------------------ Pages publiques (HTML) ------------------
 
+def _search_page_url(query: str, page: int) -> str:
+    from requests.utils import quote
+    base = f"{LIST_BASE}/{quote(query)}/"
+    return base if page <= 1 else f"{base}page/{page}/"
 
+def _fetch_list_html(query: str, page: int) -> str:
+    url = _search_page_url(query, page)
+    r = _session.get(url, headers=DEFAULT_HEADERS, timeout=25)
+    if r.status_code == 404:
+        # plus de page
+        return ""
+    r.raise_for_status()
+    return r.text
+
+def _total_from_list_html(html: str) -> Optional[int]:
+    m = re.search(r'<span class="number">\s*([\d\s]+)\s*</span>', html)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(" ", ""))
+    except Exception:
+        return None
+
+def _parse_list_html(html: str) -> List[Dict[str, Any]]:
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    cards = soup.select(".fr-card.fr-card--offer")
+    if len(cards) < 5:
+        more = soup.select(".fr-card")
+        if len(more) > len(cards):
+            cards = more
+
+    out: List[Dict[str, Any]] = []
+
+    def _txt(el):
+        if not el:
+            return None
+        if hasattr(el, "get_text"):
+            return el.get_text(strip=True)
+        return str(el).strip()
+
+    for c in cards:
+        a = c.select_one(".fr-card__title a") or c.find("a")
+        title = a.get_text(strip=True) if a else None
+        href = a["href"] if a and a.has_attr("href") else None
+
+        loc_el = c.select_one(".fr-icon-map-pin-2-line") or c.find(string=re.compile("Localisation"))
+        employer_el = c.select_one(".fr-icon-user-line") or c.find(string=re.compile("Employeur"))
+        date_el = c.select_one(".fr-icon-calendar-line") or c.find(string=re.compile("En ligne depuis"))
+        date_txt = _txt(date_el)
+
+        dt_iso: Optional[str] = None
+        if date_txt:
+            m = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', date_txt)
+            clean = m.group(1) if m else date_txt
+            dt = dateparser.parse(clean, languages=["fr"])
+            if dt:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                dt_iso = dt.isoformat()
+
+        out.append({
+            "title": (title or "Offre").strip(),
+            "url": href,
+            "location": _txt(loc_el),
+            "employer": _txt(employer_el),
+            "date": dt_iso,
+        })
+
+    # Important : on ne limite pas ici ; on trie seulement
+    out.sort(key=lambda o: _parse_any_iso(o.get("date")), reverse=True)
+    return out
+
+def _html_collect_until(query: str, needed: int) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """
+    Récupère séquentiellement page 1, 2, 3, ... et cumule les offres
+    jusqu’à atteindre 'needed' éléments OU jusqu’à ce qu’une page soit vide.
+    Retourne (liste_cumulée, total_estimé).
+    """
+    collected: List[Dict[str, Any]] = []
+    total_est: Optional[int] = None
+    page = 1
+    while len(collected) < needed:
+        html = _fetch_list_html(query, page)
+        if not html:
+            break
+        if page == 1:
+            total_est = _total_from_list_html(html)
+        items = _parse_list_html(html)
+        if not items:
+            break
+        collected.extend(items)
+        page += 1
+        # garde-fou dur en cas de pagination infinie bugguée
+        if page > 500:
+            break
+    # dédoublonnage simple par (title, url) si jamais des pages se répètent
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for it in collected:
+        key = (it.get("title"), it.get("url"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+    return deduped, total_est
+
+def _html_fetch_range_with_total(query: str, page: int, page_size: int) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    start = (page - 1) * page_size
+    end = start + page_size
+    needed = end  # on accumule jusqu'à avoir au moins 'end' éléments
+    bucket, total_est = _html_collect_until(query, needed)
+    # slice exact demandé
+    slice_ = bucket[start:end]
+    # re-tri par sécurité (au cas où)
+    slice_.sort(key=lambda o: _parse_any_iso(o.get("date")), reverse=True)
+    return slice_, total_est
+
+# ------------------ Fallback AJAX (non utilisé pour paginer) ------------------
+
+def _extract_nonce(html: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    inp = soup.find("input", {"name": "nonce"})
+    if inp and inp.get("value"):
+        return inp["value"]
+    m = re.search(r'data-nonce="([a-f0-9]{6,})"', html, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r'["\']nonce["\']\s*[:=]\s*["\']([a-zA-Z0-9]+)["\']', html)
+    return m.group(1) if m else None
+
+def _post_ajax_raw(query: str, page: int) -> str:
+    # On n'utilise pas cette voie pour paginer, juste en dernier recours pour la page 1
+    html1 = _fetch_list_html(query, 1)
+    nonce = _extract_nonce(html1)
+    if not nonce:
+        return ""
+
+    filters = {
+        "keywords": query,
+        "date": [], "contenu": [], "thematique": [], "geoloc": [], "locations": [],
+        "domains": [], "versants": [], "categories": [], "organisations": [],
+        "jobs": [], "managements": [], "remotes": [], "experiences": [],
+        "search_order": ""
+    }
+    form = {
+        "nonce": nonce,
+        "query": query,
+        "rewrite_url": _search_page_url(query, page),
+        "filters": json.dumps(filters, ensure_ascii=False),
+        "action": "get_offers",
+    }
+    headers = dict(DEFAULT_HEADERS)
+    headers.update({
+        "Referer": form["rewrite_url"],
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
+        "Origin": SITE_BASE,
+    })
+    r = _session.post(f"{SITE_BASE}/wp-admin/admin-ajax.php", headers=headers, data=form, timeout=20)
+    if r.status_code == 404:
+        return ""
+    r.raise_for_status()
+    try:
+        payload = r.json()
+        return payload.get("html") or payload.get("data") or payload.get("content") or r.text
+    except Exception:
+        return r.text
+
+def _ajax_first_page_with_total(query: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Dernier recours si la page 1 HTML échoue : tente admin-ajax pour la page 1 seulement."""
+    html = _post_ajax_raw(query, 1)
+    if not html:
+        return [], None
+    soup_items = _parse_list_html(html)
+    # total : mieux vaut le prendre depuis la page publique si possible
+    html_public = _fetch_list_html(query, 1)
+    total_est = _total_from_list_html(html_public) if html_public else None
+    return soup_items, total_est
+
+# ------------------ API publique ------------------
+
+def search_offers_with_total(
+    query: Optional[str],
+    page_size: int,
+    page: int,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Renvoie (offers, total_estimated)."""
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 10
+    if not query:
+        return [], 0
+
+    try:
+        if SEARCH_MODE in ("html", "auto"):
+            return _html_fetch_range_with_total(query=query, page=page, page_size=page_size)
+    except Exception:
+        # tente le fallback AJAX uniquement pour sécuriser la page 1
+        pass
+
+    if SEARCH_MODE in ("ajax", "auto"):
+        first, total = _ajax_first_page_with_total(query)
+        # si on demandait page 1 et page_size <= len(first), slice simple
+        if page == 1:
+            return first[:page_size], total
+        # sinon on n'a pas de pagination fiable en AJAX, donc on renvoie ce qu'on peut
+        return [], total
 
 def search_offers(
     query: Optional[str] = None,
     page_size: int = 50,
     page: int = 1,
 ) -> List[Dict[str, Any]]:
-    params = {"page_size": page_size, "page": page}
-    if query:
-        params["__contains"] = query         # filtrage côté Tabular API
+    offers, _ = search_offers_with_total(query=query, page_size=page_size, page=page)
+    return offers
 
-    data = _api_get(params)
-    rows: List[Dict[str, Any]] = data.get("data", [])
-
-    # (Filtre Python optionnel, à garder si la ressource ne supporte pas __contains)
-    # if query:
-    #     qlow = query.lower()
-    #     rows = [r for r in rows if qlow in extract_title(r).lower()]
-
-    if COLUMN_DATE:
-        rows.sort(key=lambda r: r.get(COLUMN_DATE) or "", reverse=True)
-    return rows
-
-
-# ----------------------------
-# Debug helper pour /debug/schema
-# ----------------------------
 def get_detected_columns() -> Dict[str, Any]:
-    return {
-        "COLUMN_ID": COLUMN_ID,
-        "COLUMN_TITLE": COLUMN_TITLE,
-        "COLUMN_DATE": COLUMN_DATE,
-        "COLUMN_URL": COLUMN_URL,
-        "known_fields": sorted(_field_names) if _field_names else [],
-        "ENV": {
-            "ID_KEY": ENV_ID,
-            "TITLE_KEY": ENV_TITLE,
-            "DATE_KEY": ENV_DATE,
-            "URL_KEY": ENV_URL,
-        },
-    }
+    return {}
