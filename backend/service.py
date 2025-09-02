@@ -235,36 +235,31 @@ def search_offers(
     query = query.strip()
     need = page * page_size  # combien d'items au total à avoir avant de trancher
     acc: List[Dict[str, Any]] = []
+    seen: set[str] = set()
     current_site_page = 1
+    has_next = True
 
-    while len(acc) < need:
+    while len(acc) < need and has_next:
         items, has_next = _fetch_list_page(query, current_site_page)
-        if not items:
-            break
-        acc.extend(items)
         current_site_page += 1
-        if not has_next:
+        for o in items:
+            k = _stable_id(o)
+            if k and k not in seen:
+                acc.append(o)
+                seen.add(k)
+        if not items:
             break
         if current_site_page > 500:  # garde-fou
             break
 
-    # Dédoublonnage (préserve l'ordre d'apparition initial)
-    seen: set[str] = set()
-    uniq: List[Dict[str, Any]] = []
-    for o in acc:
-        k = _stable_id(o)
-        if k and k not in seen:
-            uniq.append(o)
-            seen.add(k)
-
     # Tri STABLE : d'abord tie-breaker (id ASC), puis date DESC
-    uniq.sort(key=_stable_id)  # id ASC
-    uniq.sort(key=lambda o: _parse_date_safe(o.get("date")), reverse=True)  # date DESC (stable)
+    acc.sort(key=_stable_id)  # id ASC
+    acc.sort(key=lambda o: _parse_date_safe(o.get("date")), reverse=True)  # date DESC (stable)
 
     # Découpage exact
     start = max(0, (page - 1) * page_size)
     end = start + page_size
-    return uniq[start:end]
+    return acc[start:end]
 
 
 def get_detected_columns() -> Dict[str, Any]:
