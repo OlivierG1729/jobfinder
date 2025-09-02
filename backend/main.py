@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 try:
     from dotenv import load_dotenv  # type: ignore
+
     ROOT = Path(__file__).resolve().parents[1]
     load_dotenv(dotenv_path=ROOT / ".env", override=True)
 except Exception:
@@ -18,14 +19,14 @@ except Exception:
 from .db import init_db, get_conn
 from .scheduler import start_scheduler
 from .service import (
-    search_offers_with_total,  # ← utilise la nouvelle signature (offers, total)
+    search_offers,           # ✅ c'est la seule fonction de recherche à utiliser
     extract_offer_id,
     extract_title,
     extract_date,
     extract_url,
 )
 
-app = FastAPI(title="CSP Job Search API", version="1.2.0")
+app = FastAPI(title="CSP Job Search API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,50 +36,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class SearchQuery(BaseModel):
     q: Optional[str] = None
     page_size: int = 50
     page: int = 1
 
+
 class SaveSearch(BaseModel):
     q: str
     email: Optional[str] = None
+
 
 @app.on_event("startup")
 def on_startup():
     init_db()
     start_scheduler()
 
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True}
 
+
 @app.post("/search")
 def post_search(body: SearchQuery) -> Dict[str, Any]:
+    """
+    Appelle la recherche distante et renvoie une liste normalisée.
+    """
     try:
-        offers, total_estimated = search_offers_with_total(
-            query=body.q, page_size=body.page_size, page=body.page
-        )
+        offers = search_offers(query=body.q, page_size=body.page_size, page=body.page)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    items = []
+    result = []
     for o in offers:
-        items.append(
+        result.append(
             {
-                "id": extract_offer_id(o),
-                "title": extract_title(o),
-                "date": extract_date(o),
-                "url": extract_url(o),
+                "id": extract_offer_id(o) if isinstance(o, dict) else None,
+                "title": extract_title(o) if isinstance(o, dict) else "",
+                "date": extract_date(o) if isinstance(o, dict) else None,
+                "url": extract_url(o) if isinstance(o, dict) else None,
                 "raw": o,
             }
         )
-    return {
-        "items": items,
-        "page": body.page,
-        "page_size": body.page_size,
-        "total_estimated": total_estimated,  # ← exposé au frontend si présent
-    }
+    # pas de total fiable côté site -> on expose seulement la page actuelle
+    return {"items": result, "page": body.page, "page_size": body.page_size}
+
 
 @app.post("/save_search")
 def save_search(body: SaveSearch) -> Dict[str, Any]:
@@ -93,6 +97,7 @@ def save_search(body: SaveSearch) -> Dict[str, Any]:
     finally:
         con.close()
     return {"ok": True}
+
 
 @app.get("/saved_searches")
 def list_saved() -> Dict[str, List[Dict[str, Any]]]:
