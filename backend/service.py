@@ -1,315 +1,323 @@
 # backend/service.py
-"""Recherche CSP par scraping des pages publiques (parité maximale avec le site).
+"""
+Accès à la recherche de https://choisirleservicepublic.gouv.fr
+
 Stratégie :
-- On lit les pages HTML publiques :
-  https://choisirleservicepublic.gouv.fr/nos-offres/filtres/mot-cles/<query>/page/N/
-- On PARCOURT les pages 1, 2, 3, ... jusqu’à cumuler AU MOINS page*page_size éléments.
-- On renvoie la tranche demandée [start:end], triée par date décroissante.
-- On expose aussi un total estimé si détectable.
-Un fallback AJAX est gardé en dernier recours, mais n’est pas utilisé pour paginer.
+1) On tente d'utiliser l'endpoint AJAX officiel (admin-ajax.php) qui alimente le site.
+   - On récupère un 'nonce' en chargeant une page publique puis on POSTe
+     { action: get_offers, query, filters, rewrite_url } en multipart/form-data.
+   - On gère la pagination via page & per_page si exposés ; sinon on découpe côté client.
+
+2) En secours, on tente un endpoint JSON public si un jour il est exposé (BASE_JSON).
+
+On renvoie une liste d'offres normalisées et triées par date décroissante.
 """
 
 from __future__ import annotations
 
-import os
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 import json
 import re
-from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
-import dateparser
 
-# ------------------ Config ------------------
+# ---------------------------------------------------------------------------
+# Constantes cibles (site WordPress avec admin-ajax)
+# ---------------------------------------------------------------------------
 
-SITE_BASE = "https://choisirleservicepublic.gouv.fr"
-LIST_BASE = f"{SITE_BASE}/nos-offres/filtres/mot-cles"
-SEARCH_MODE = os.getenv("SEARCH_MODE", "html").lower()  # html|ajax|auto
+SITE = "https://choisirleservicepublic.gouv.fr"
+AJAX = f"{SITE}/wp-admin/admin-ajax.php"   # endpoint AJAX WordPress
+LISTING_URL = f"{SITE}/nos-offres/"        # page publique pour récupérer le nonce
 
-_session = requests.Session()
-DEFAULT_HEADERS = {
-    "User-Agent": "JobFinder/1.0",
-    "Referer": f"{SITE_BASE}/nos-offres/",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+# S’il existe un jour un vrai endpoint JSON :
+BASE_JSON = f"{SITE}/api/offres"  # utilisé en fallback si disponible
 
-# ------------------ Utilitaires ------------------
 
-def _parse_any_iso(dt_str: Optional[str]) -> datetime:
-    if not dt_str:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    s = dt_str.strip().replace("Z", "+00:00")
+# ---------------------------------------------------------------------------
+# Helpers HTTP
+# ---------------------------------------------------------------------------
+
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
+        "Accept": "*/*",
+    }
+)
+
+
+def _iso_or_none(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    # Normalise quelques formats courants
     try:
-        return datetime.fromisoformat(s)
+        # Ex: 2025-08-24T12:34:56Z
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).isoformat()
     except Exception:
-        try:
-            dt = dateparser.parse(s, languages=["fr", "en"])
-            if dt is None:
-                return datetime.min.replace(tzinfo=timezone.utc)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            return datetime.min.replace(tzinfo=timezone.utc)
+        pass
+
+    # Ex: "En ligne depuis le 06 août 2025" -> tente d’extraire la date
+    m = re.search(r"(\d{1,2})\s+([A-Za-zéûôà]+)\s+(\d{4})", s)
+    if m:
+        jour, mois_str, an = m.groups()
+        mois_map = {
+            "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
+            "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9,
+            "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
+        }
+        mois = mois_map.get(mois_str.lower())
+        if mois:
+            try:
+                d = datetime(int(an), int(mois), int(jour))
+                return d.isoformat()
+            except Exception:
+                pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Extraction champs
+# ---------------------------------------------------------------------------
 
 def extract_offer_id(off: Dict[str, Any]) -> Optional[str]:
     for key in ("id", "_id", "offer_id", "reference", "ref"):
-        val = off.get(key)
-        if val is not None:
-            return str(val)
+        if key in off and off[key]:
+            return str(off[key])
+    # parfois l’URL contient l’identifiant
+    url = off.get("url")
+    if isinstance(url, str):
+        m = re.search(r"/offre-emploi/[^/]+-reference-([^/]+)/?$", url)
+        if m:
+            return m.group(1)
     return None
+
 
 def extract_title(off: Dict[str, Any]) -> str:
-    for key in ("intitule", "intitulé", "titre", "title", "intituleOffre"):
-        val = off.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    for val in off.values():
-        if isinstance(val, str) and val.strip() and not val.startswith(("http://", "https://")):
-            return val.strip()
+    for k in ("title", "intitule", "intitulé", "titre"):
+        v = off.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return "Offre"
 
+
 def extract_date(off: Dict[str, Any]) -> Optional[str]:
-    for key in ("datePublication", "date_publication", "publication_date", "date",
-                "dateEnLigne", "published_at", "createdAt"):
-        val = off.get(key)
-        if isinstance(val, str) and val:
-            return val
+    for k in ("publication_date", "datePublication", "date_publication", "date"):
+        v = off.get(k)
+        if isinstance(v, str) and v.strip():
+            return _iso_or_none(v)
+    # fallback : parfois une chaîne "En ligne depuis le …"
+    if isinstance(off.get("date_text"), str):
+        return _iso_or_none(off["date_text"])
     return None
+
 
 def extract_url(off: Dict[str, Any]) -> Optional[str]:
-    for key in ("url", "lien", "link", "apply_url"):
-        val = off.get(key)
-        if isinstance(val, str) and val:
-            return val
+    for k in ("url", "lien", "link"):
+        v = off.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     oid = extract_offer_id(off)
     if oid:
-        return f"{SITE_BASE}/offre-emploi/{oid}/"
+        return f"{SITE}/offre/{oid}"
     return None
 
-# ------------------ Pages publiques (HTML) ------------------
 
-def _search_page_url(query: str, page: int) -> str:
-    from requests.utils import quote
-    base = f"{LIST_BASE}/{quote(query)}/"
-    return base if page <= 1 else f"{base}page/{page}/"
+# ---------------------------------------------------------------------------
+# Récupération du nonce + POST AJAX
+# ---------------------------------------------------------------------------
 
-def _fetch_list_html(query: str, page: int) -> str:
-    url = _search_page_url(query, page)
-    r = _session.get(url, headers=DEFAULT_HEADERS, timeout=25)
-    if r.status_code == 404:
-        # plus de page
-        return ""
+def _fetch_nonce() -> Optional[str]:
+    """
+    Charge une page publique et essaie d’y récupérer le 'nonce'
+    utilisé par l’action AJAX get_offers.
+    """
+    r = SESSION.get(LISTING_URL, timeout=30)
     r.raise_for_status()
-    return r.text
+    html = r.text
 
-def _total_from_list_html(html: str) -> Optional[int]:
-    m = re.search(r'<span class="number">\s*([\d\s]+)\s*</span>', html)
-    if not m:
-        return None
-    try:
-        return int(m.group(1).replace(" ", ""))
-    except Exception:
-        return None
-
-def _parse_list_html(html: str) -> List[Dict[str, Any]]:
-    if not html:
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    cards = soup.select(".fr-card.fr-card--offer")
-    if len(cards) < 5:
-        more = soup.select(".fr-card")
-        if len(more) > len(cards):
-            cards = more
-
-    out: List[Dict[str, Any]] = []
-
-    def _txt(el):
-        if not el:
-            return None
-        if hasattr(el, "get_text"):
-            return el.get_text(strip=True)
-        return str(el).strip()
-
-    for c in cards:
-        a = c.select_one(".fr-card__title a") or c.find("a")
-        title = a.get_text(strip=True) if a else None
-        href = a["href"] if a and a.has_attr("href") else None
-
-        loc_el = c.select_one(".fr-icon-map-pin-2-line") or c.find(string=re.compile("Localisation"))
-        employer_el = c.select_one(".fr-icon-user-line") or c.find(string=re.compile("Employeur"))
-        date_el = c.select_one(".fr-icon-calendar-line") or c.find(string=re.compile("En ligne depuis"))
-        date_txt = _txt(date_el)
-
-        dt_iso: Optional[str] = None
-        if date_txt:
-            m = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', date_txt)
-            clean = m.group(1) if m else date_txt
-            dt = dateparser.parse(clean, languages=["fr"])
-            if dt:
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dt_iso = dt.isoformat()
-
-        out.append({
-            "title": (title or "Offre").strip(),
-            "url": href,
-            "location": _txt(loc_el),
-            "employer": _txt(employer_el),
-            "date": dt_iso,
-        })
-
-    # Important : on ne limite pas ici ; on trie seulement
-    out.sort(key=lambda o: _parse_any_iso(o.get("date")), reverse=True)
-    return out
-
-def _html_collect_until(query: str, needed: int) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """
-    Récupère séquentiellement page 1, 2, 3, ... et cumule les offres
-    jusqu’à atteindre 'needed' éléments OU jusqu’à ce qu’une page soit vide.
-    Retourne (liste_cumulée, total_estimé).
-    """
-    collected: List[Dict[str, Any]] = []
-    total_est: Optional[int] = None
-    page = 1
-    while len(collected) < needed:
-        html = _fetch_list_html(query, page)
-        if not html:
-            break
-        if page == 1:
-            total_est = _total_from_list_html(html)
-        items = _parse_list_html(html)
-        if not items:
-            break
-        collected.extend(items)
-        page += 1
-        # garde-fou dur en cas de pagination infinie bugguée
-        if page > 500:
-            break
-    # dédoublonnage simple par (title, url) si jamais des pages se répètent
-    seen = set()
-    deduped: List[Dict[str, Any]] = []
-    for it in collected:
-        key = (it.get("title"), it.get("url"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    return deduped, total_est
-
-def _html_fetch_range_with_total(query: str, page: int, page_size: int) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    start = (page - 1) * page_size
-    end = start + page_size
-    needed = end  # on accumule jusqu'à avoir au moins 'end' éléments
-    bucket, total_est = _html_collect_until(query, needed)
-    # slice exact demandé
-    slice_ = bucket[start:end]
-    # re-tri par sécurité (au cas où)
-    slice_.sort(key=lambda o: _parse_any_iso(o.get("date")), reverse=True)
-    return slice_, total_est
-
-# ------------------ Fallback AJAX (non utilisé pour paginer) ------------------
-
-def _extract_nonce(html: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    inp = soup.find("input", {"name": "nonce"})
-    if inp and inp.get("value"):
-        return inp["value"]
-    m = re.search(r'data-nonce="([a-f0-9]{6,})"', html, re.I)
+    # 1) Cherche un script contenant 'ajax_nonce' / 'nonce'
+    m = re.search(r'ajax_nonce["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', html)
     if m:
         return m.group(1)
-    m = re.search(r'["\']nonce["\']\s*[:=]\s*["\']([a-zA-Z0-9]+)["\']', html)
-    return m.group(1) if m else None
 
-def _post_ajax_raw(query: str, page: int) -> str:
-    # On n'utilise pas cette voie pour paginer, juste en dernier recours pour la page 1
-    html1 = _fetch_list_html(query, 1)
-    nonce = _extract_nonce(html1)
+    # 2) Cherche un meta/hidden input
+    soup = BeautifulSoup(html, "html.parser")
+    for css in ("input[name=nonce]", "input[name=_ajax_nonce]", "meta[name=nonce]"):
+        el = soup.select_one(css)
+        if el and (el.get("value") or el.get("content")):
+            return el.get("value") or el.get("content")
+
+    # 3) Dernier fallback : heuristique
+    m2 = re.search(r'name=["\']nonce["\']\s+value=["\']([a-zA-Z0-9]+)["\']', html)
+    if m2:
+        return m2.group(1)
+
+    return None
+
+
+def _ajax_search_site(query: Optional[str], page: int, page_size: int) -> List[Dict[str, Any]]:
+    """
+    Appelle l’endpoint AJAX du site avec le même payload que le front.
+    """
+    nonce = _fetch_nonce()
     if not nonce:
-        return ""
+        # Si le nonce n’est pas trouvable, on tente quand même (certains sites ne vérifient pas)
+        nonce = ""
 
+    # Le site envoie un multipart/form-data ; requests gère ça avec 'files' ou 'data'.
+    # Ici, 'data' suffit : WP AJAX lit $_POST.
     filters = {
-        "keywords": query,
-        "date": [], "contenu": [], "thematique": [], "geoloc": [], "locations": [],
-        "domains": [], "versants": [], "categories": [], "organisations": [],
-        "jobs": [], "managements": [], "remotes": [], "experiences": [],
-        "search_order": ""
+        "keywords": (query or "").strip(),
+        "date": [],
+        "contenu": [],
+        "thematique": [],
+        "geoloc": [],
+        "locations": [],
+        "domains": [],
+        "versants": [],
+        "categories": [],
+        "organisations": [],
+        "jobs": [],
+        "managements": [],
+        "remotes": [],
+        "experiences": [],
+        "search_order": "",
+        # beaucoup d'implémentations supportent page & per_page
+        "page": page,
+        "per_page": page_size,
     }
-    form = {
+
+    payload = {
         "nonce": nonce,
-        "query": query,
-        "rewrite_url": _search_page_url(query, page),
+        "query": (query or "").strip(),
+        "rewrite_url": f"{SITE}/nos-offres/filtres/mot-cles/{(query or '').strip()}/" if query else f"{SITE}/nos-offres/",
         "filters": json.dumps(filters, ensure_ascii=False),
         "action": "get_offers",
     }
-    headers = dict(DEFAULT_HEADERS)
-    headers.update({
-        "Referer": form["rewrite_url"],
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
-        "Origin": SITE_BASE,
-    })
-    r = _session.post(f"{SITE_BASE}/wp-admin/admin-ajax.php", headers=headers, data=form, timeout=20)
-    if r.status_code == 404:
-        return ""
+
+    r = SESSION.post(AJAX, data=payload, timeout=30)
     r.raise_for_status()
+    # Certaines instances renvoient du HTML ; d’autres du JSON.
+    # On tente JSON d’abord, sinon on parse HTML.
+    text = r.text.strip()
+
+    # JSON direct ?
     try:
-        payload = r.json()
-        return payload.get("html") or payload.get("data") or payload.get("content") or r.text
+        data = r.json()
+        items = data.get("items") or data.get("results") or data.get("data") or []
+        return _normalize_items(items)
     except Exception:
-        return r.text
-
-def _ajax_first_page_with_total(query: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """Dernier recours si la page 1 HTML échoue : tente admin-ajax pour la page 1 seulement."""
-    html = _post_ajax_raw(query, 1)
-    if not html:
-        return [], None
-    soup_items = _parse_list_html(html)
-    # total : mieux vaut le prendre depuis la page publique si possible
-    html_public = _fetch_list_html(query, 1)
-    total_est = _total_from_list_html(html_public) if html_public else None
-    return soup_items, total_est
-
-# ------------------ API publique ------------------
-
-def search_offers_with_total(
-    query: Optional[str],
-    page_size: int,
-    page: int,
-) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """Renvoie (offers, total_estimated)."""
-    if page < 1:
-        page = 1
-    if page_size < 1:
-        page_size = 10
-    if not query:
-        return [], 0
-
-    try:
-        if SEARCH_MODE in ("html", "auto"):
-            return _html_fetch_range_with_total(query=query, page=page, page_size=page_size)
-    except Exception:
-        # tente le fallback AJAX uniquement pour sécuriser la page 1
         pass
 
-    if SEARCH_MODE in ("ajax", "auto"):
-        first, total = _ajax_first_page_with_total(query)
-        # si on demandait page 1 et page_size <= len(first), slice simple
-        if page == 1:
-            return first[:page_size], total
-        # sinon on n'a pas de pagination fiable en AJAX, donc on renvoie ce qu'on peut
-        return [], total
+    # HTML -> on extrait les cartes (liens + dates + titres)
+    return _parse_offers_from_html(text)
+
+
+def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        out.append(
+            {
+                "id": extract_offer_id(it),
+                "title": extract_title(it),
+                "date": extract_date(it),
+                "url": extract_url(it),
+                "raw": it,
+            }
+        )
+    # tri date décroissante
+    def key_date(x: Dict[str, Any]) -> datetime:
+        d = x.get("date")
+        if not d:
+            return datetime.min
+        try:
+            return datetime.fromisoformat(str(d).replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min
+
+    out.sort(key=key_date, reverse=True)
+    return out
+
+
+def _parse_offers_from_html(html: str) -> List[Dict[str, Any]]:
+    """
+    Parse le HTML de la liste d’offres (cartes) et extrait titre / url / date.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select(".fr-card--offer, .fr-card.fr-card--offer, .fr-card__title a")
+    results: List[Dict[str, Any]] = []
+
+    # Stratégie : chaque carte possède un <h3 class="fr-card__title"><a href="...">Titre</a></h3>
+    for card in soup.select(".fr-card"):
+        a = card.select_one("h3.fr-card__title a[href]")
+        if not a:
+            continue
+        url = a.get("href", "").strip()
+        title = (a.get_text() or "").strip()
+
+        # texte contenant la date "En ligne depuis le …"
+        date_text = None
+        for li in card.select("li"):
+            t = (li.get_text(" ", strip=True) or "").strip()
+            if "En ligne depuis" in t:
+                date_text = t
+                break
+
+        item = {
+            "title": title,
+            "url": url,
+            "date_text": date_text,
+        }
+        item["date"] = extract_date(item)
+        results.append(item)
+
+    return _normalize_items(results)
+
+
+# ---------------------------------------------------------------------------
+# Fallback JSON (au cas où BASE_JSON existe)
+# ---------------------------------------------------------------------------
+
+def _json_api_search(query: Optional[str], page: int, page_size: int) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {"page": page, "limit": page_size}
+    if query:
+        params["q"] = query
+    r = SESSION.get(BASE_JSON, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    items = data.get("results") or data.get("data") or []
+    return _normalize_items(items)
+
+
+# ---------------------------------------------------------------------------
+# API unique appelée par le backend
+# ---------------------------------------------------------------------------
 
 def search_offers(
     query: Optional[str] = None,
     page_size: int = 50,
     page: int = 1,
 ) -> List[Dict[str, Any]]:
-    offers, _ = search_offers_with_total(query=query, page_size=page_size, page=page)
-    return offers
+    """
+    Recherche principale appelée par l’API FastAPI.
+    Tente AJAX (site) puis JSON (fallback).
+    """
+    # 1) Essai AJAX (site)
+    try:
+        items = _ajax_search_site(query=query, page=page, page_size=page_size)
+        if items:
+            return items
+    except Exception:
+        pass
 
-def get_detected_columns() -> Dict[str, Any]:
-    return {}
+    # 2) Fallback JSON si dispo
+    try:
+        return _json_api_search(query=query, page=page, page_size=page_size)
+    except Exception:
+        # si tout échoue, retourne une liste vide (l’API remontera l’erreur si besoin)
+        return []
