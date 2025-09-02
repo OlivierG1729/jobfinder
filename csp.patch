@@ -1,0 +1,58 @@
+diff --git a/requirements.txt b/requirements.txt
+index e69de29..f65a2c1 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@
++# Recherche déléguée au site CSP (AJAX WordPress) : HTTP + parsing HTML + dates FR
++requests
++beautifulsoup4
++dateparser
+
+diff --git a/frontend/csp_client.py b/frontend/csp_client.py
+new file mode 100644
+index 0000000..2ab1234
+--- /dev/null
++++ b/frontend/csp_client.py
+@@
++[... tout le contenu du fichier csp_client.py que je t’ai donné ...]
++
+diff --git a/frontend/streamlit_app.py b/frontend/streamlit_app.py
+index 2ab1234..5cd6789 100644
+--- a/frontend/streamlit_app.py
++++ b/frontend/streamlit_app.py
+@@
+-[... ancien contenu supprimé ...]
++import streamlit as st
++import pandas as pd
++from frontend.csp_client import CSPClient
++
++st.set_page_config(page_title="JobFinder – Choisir le service public", layout="wide")
++st.title("JobFinder – Recherche CSP (déléguée)")
++
++q = st.text_input("Mots-clés", value="analyste", help="Tape un mot-clé (ex: analyste, data, développeur…)")
++col1, col2 = st.columns([1,1])
++with col1:
++    page = st.number_input("Page", min_value=1, value=1, step=1)
++with col2:
++    tri = st.selectbox("Tri par date", ["Plus récent d’abord", "Plus ancien d’abord"])
++
++@st.cache_data(ttl=300, show_spinner=False)
++def fetch_offers(query: str, page: int, order_desc: bool):
++    client = CSPClient()
++    html = client.search_html(query, page=page)
++    offers = client.parse_offers(html)
++    df = pd.DataFrame(offers)
++    if not df.empty and "date_dt" in df.columns:
++        df = df.sort_values("date_dt", ascending=(not order_desc), na_position="last")
++    return df
++
++if st.button("Rechercher"):
++    with st.spinner("Recherche en cours…"):
++        try:
++            order_desc = (tri == "Plus récent d’abord")
++            df = fetch_offers(q, page, order_desc)
++            st.write(f"{len(df)} résultats (page {page})")
++            st.dataframe(df[["title","employer","location","date_text","url"]], use_container_width=True)
++        except Exception as e:
++            st.error(f"Erreur lors de la recherche : {e}")
++            st.info("Astuce : relance la recherche, le nonce peut expirer, ou essaie un autre mot-clé.")
