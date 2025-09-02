@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 import html as _html
 import re
+import hashlib
 
 import requests
 from bs4 import BeautifulSoup
@@ -244,7 +245,14 @@ def search_offers(
         current_site_page += 1
         for o in items:
             k = _stable_id(o)
-            if k and k not in seen:
+            if not k:
+                title = extract_title(o)
+                date = extract_date(o) or ""
+                if title or date:
+                    k = hashlib.sha1(f"{title}|{date}".encode("utf-8")).hexdigest()
+                else:
+                    k = f"idx-{len(acc)}"
+            if k not in seen:
                 acc.append(o)
                 seen.add(k)
         if not items:
