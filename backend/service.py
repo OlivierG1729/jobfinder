@@ -14,6 +14,7 @@ from datetime import datetime
 import html as _html
 import re
 import hashlib
+import time
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,6 +38,10 @@ SESSION.headers.update(
         "Referer": f"{SITE}/nos-offres/",
     }
 )
+
+# Cache des résultats : clé (query, page_size) -> (liste complète, timestamp)
+_CACHE_TTL_SECONDS = 3600  # 1h par défaut
+_SEARCH_CACHE: Dict[tuple[str, int], tuple[List[Dict[str, Any]], float]] = {}
 
 
 # --------- Helpers d'extraction (API interne du backend) ---------
@@ -233,11 +238,52 @@ def _stable_id(off: Dict[str, Any]) -> str:
     )
 
 
+def _get_cached_results(query: str, page_size: int, refresh_cache: bool = False) -> List[Dict[str, Any]]:
+    key = (query, page_size)
+    now = time.time()
+    if not refresh_cache:
+        cached = _SEARCH_CACHE.get(key)
+        if cached and now - cached[1] < _CACHE_TTL_SECONDS:
+            return cached[0]
+
+    acc: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    current_site_page = 1
+    has_next = True
+
+    while has_next:
+        items, has_next = _fetch_list_page(query, current_site_page)
+        current_site_page += 1
+        for o in items:
+            k = _stable_id(o)
+            if not k:
+                title = extract_title(o)
+                date = extract_date(o) or ""
+                if title or date:
+                    k = hashlib.sha1(f"{title}|{date}".encode("utf-8")).hexdigest()
+                else:
+                    k = f"idx-{len(acc)}"
+            if k not in seen:
+                acc.append(o)
+                seen.add(k)
+        if not items:
+            break
+        if current_site_page > 500:
+            break
+
+    acc.sort(key=_stable_id)
+    acc.sort(key=lambda o: _parse_date_safe(o.get("date")), reverse=True)
+
+    _SEARCH_CACHE[key] = (acc, now)
+    return acc
+
+
 def search_offers(
     query: Optional[str] = None,
     page_size: int = 50,
     page: int = 1,
     fast_mode: bool = False,
+    refresh_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Pagination user-friendly & STABLE :
@@ -264,37 +310,9 @@ def search_offers(
     if fast_mode:
         items, _ = _fetch_list_page(query, page)
         return items
-    need = page * page_size  # combien d'items au total à avoir avant de trancher
-    acc: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    current_site_page = 1
-    has_next = True
 
-    while len(acc) < need and has_next:
-        items, has_next = _fetch_list_page(query, current_site_page)
-        current_site_page += 1
-        for o in items:
-            k = _stable_id(o)
-            if not k:
-                title = extract_title(o)
-                date = extract_date(o) or ""
-                if title or date:
-                    k = hashlib.sha1(f"{title}|{date}".encode("utf-8")).hexdigest()
-                else:
-                    k = f"idx-{len(acc)}"
-            if k not in seen:
-                acc.append(o)
-                seen.add(k)
-        if not items:
-            break
-        if current_site_page > 500:  # garde-fou
-            break
+    acc = _get_cached_results(query, page_size, refresh_cache=refresh_cache)
 
-    # Tri STABLE : d'abord tie-breaker (id ASC), puis date DESC
-    acc.sort(key=_stable_id)  # id ASC
-    acc.sort(key=lambda o: _parse_date_safe(o.get("date")), reverse=True)  # date DESC (stable)
-
-    # Découpage exact
     start = max(0, (page - 1) * page_size)
     end = start + page_size
     return acc[start:end]
