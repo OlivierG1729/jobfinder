@@ -15,6 +15,7 @@ import html as _html
 import re
 import hashlib
 import time
+import unicodedata
 
 import requests
 from bs4 import BeautifulSoup
@@ -135,13 +136,29 @@ def _parse_date_fr(text: str) -> Optional[str]:
         return None
 
 
+_SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
+
+def _slugify(q: str) -> str:
+    """Génère un slug ASCII pour les requêtes de recherche."""
+    if not q:
+        return ""
+    # Normaliser et supprimer les accents
+    q = unicodedata.normalize("NFKD", q)
+    q = q.encode("ascii", "ignore").decode("ascii")
+    # Remplacer les caractères non alphanumériques par des '-'
+    q = _SLUG_RE.sub("-", q)
+    # Réduire les tirets consécutifs et convertir en minuscules
+    q = re.sub("-+", "-", q).strip("-")
+    return q.lower()
+
+
 def _fetch_list_page(query: str, page: int) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Récupère une page publique (en général 20 offres), parse l’HTML.
     Retourne (offres, has_next)
     """
     global SESSION
-    q = requests.utils.quote(query, safe="")
+    q = _slugify(query)
     url = BASE_LIST.format(q=q) if page <= 1 else PAGE_URL.format(q=q, page=page)
 
     try:
