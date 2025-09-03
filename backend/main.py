@@ -39,8 +39,7 @@ app.add_middleware(
 
 class SearchQuery(BaseModel):
     q: Optional[str] = None
-    page_size: int = 50
-    page: int = 1
+    limit: int = 50
 
 
 class SaveSearch(BaseModel):
@@ -65,7 +64,7 @@ def post_search(body: SearchQuery) -> Dict[str, Any]:
     Appelle la recherche distante et renvoie une liste normalisée.
     """
     try:
-        offers = search_offers(query=body.q, page_size=body.page_size, page=body.page)
+        offers = search_offers(query=body.q, limit=body.limit)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -81,7 +80,7 @@ def post_search(body: SearchQuery) -> Dict[str, Any]:
             }
         )
     # pas de total fiable côté site -> on expose seulement la page actuelle
-    return {"items": result, "page": body.page, "page_size": body.page_size}
+    return {"items": result, "limit": body.limit}
 
 
 @app.post("/save_search")
