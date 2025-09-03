@@ -38,7 +38,7 @@ def send_ntfy(title: str, message: str):
 def check_once():
     con = get_conn(); cur = con.cursor()
     for (query, email) in cur.execute("SELECT query, email FROM saved_searches"):
-        offers = search_offers(query=query, page_size=50)
+        offers = search_offers(query=query, limit=50)
         # Load seen into set
         cur2 = con.cursor()
         cur2.execute("SELECT offer_id FROM seen")

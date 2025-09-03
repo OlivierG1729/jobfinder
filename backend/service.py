@@ -3,7 +3,7 @@
 Recherche CSP en parsant les pages publiques (fiable et sans nonce).
 Objectifs :
 - Toujours trier par date décroissante (plus récent -> plus ancien).
-- Pagination stable : page 1 = éléments 1..N, page 2 = N+1..2N, etc.
+- Limiter le nombre de résultats via un paramètre ``limit``.
 - Dédoublonnage (au cas où une offre apparaisse sur plusieurs pages côté site).
 """
 
@@ -39,10 +39,9 @@ SESSION.headers.update(
     }
 )
 
-# Cache des résultats : clé (query, page_size) -> (liste complète, timestamp)
+# Cache des résultats : clé query -> (résultats cumulés, dernière page récupérée, timestamp)
 _CACHE_TTL_SECONDS = 3600  # 1h par défaut
-# clé (query, page_size) -> (résultats cumulés, dernière page récupérée, timestamp)
-_SEARCH_CACHE: Dict[tuple[str, int], tuple[List[Dict[str, Any]], int, float]] = {}
+_SEARCH_CACHE: Dict[str, tuple[List[Dict[str, Any]], int, float]] = {}
 
 
 # --------- Helpers d'extraction (API interne du backend) ---------
@@ -241,21 +240,19 @@ def _stable_id(off: Dict[str, Any]) -> str:
 
 def _get_cached_results(
     query: str,
-    page_size: int,
-    page: int,
+    limit: int,
     refresh_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     """Retourne la liste complète des résultats pour une requête donnée.
 
-    Seule une portion des pages du site est récupérée en fonction de la page
-    demandée. Les pages supplémentaires sont stockées dans le cache avec le
-    dernier numéro de page consulté afin de reprendre la récupération plus
-    tard sans repartir de la page 1.
+    On cumule les pages du site jusqu'à atteindre ``limit`` offres. Les
+    résultats sont mis en cache pour éviter de repartir de la page 1 lors des
+    appels suivants.
     """
 
     from concurrent.futures import ThreadPoolExecutor
 
-    key = (query, page_size)
+    key = query
     now = time.time()
 
     acc: List[Dict[str, Any]]
@@ -273,7 +270,7 @@ def _get_cached_results(
         acc = []
         last_site_page = 0
 
-    needed_items = page * page_size
+    needed_items = limit
 
     while len(acc) < needed_items:
         missing = needed_items - len(acc)
@@ -322,42 +319,22 @@ def _get_cached_results(
 
 def search_offers(
     query: Optional[str] = None,
-    page_size: int = 50,
-    page: int = 1,
+    limit: int = 50,
     fast_mode: bool = False,
     refresh_cache: bool = False,
 ) -> List[Dict[str, Any]]:
-    """
-    Pagination user-friendly & STABLE :
-
-      page=1  -> items 1..page_size  (les plus récents)
-      page=2  -> items (page_size+1)..(2*page_size)
-      etc.
-
-    Implémentation :
-    - on cumule des pages du site jusqu'à atteindre page*page_size items,
-    - on dédoublonne,
-    - on trie : date DESC puis stable_id ASC (ordre stable pour les dates identiques),
-    - on découpe par offset (start/end).
-
-    fast_mode:
-      Si True, on ne récupère que la page demandée sur le site et on
-      retourne la liste telle quelle (page_size ignoré). Cela supprime la
-      garantie de pagination stable.
-    """
+    """Recherche simple avec limite sur le nombre d'offres retournées."""
     if not query or not query.strip():
         return []
 
     query = query.strip()
     if fast_mode:
-        items, _ = _fetch_list_page(query, page)
+        items, _ = _fetch_list_page(query, 1)
         return items
 
-    acc = _get_cached_results(query, page_size, page, refresh_cache=refresh_cache)
+    acc = _get_cached_results(query, limit, refresh_cache=refresh_cache)
 
-    start = max(0, (page - 1) * page_size)
-    end = start + page_size
-    return acc[start:end]
+    return acc[:limit]
 
 
 def get_detected_columns() -> Dict[str, Any]:
