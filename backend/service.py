@@ -41,7 +41,8 @@ SESSION.headers.update(
 
 # Cache des résultats : clé (query, page_size) -> (liste complète, timestamp)
 _CACHE_TTL_SECONDS = 3600  # 1h par défaut
-_SEARCH_CACHE: Dict[tuple[str, int], tuple[List[Dict[str, Any]], float]] = {}
+# clé (query, page_size) -> (résultats cumulés, dernière page récupérée, timestamp)
+_SEARCH_CACHE: Dict[tuple[str, int], tuple[List[Dict[str, Any]], int, float]] = {}
 
 
 # --------- Helpers d'extraction (API interne du backend) ---------
@@ -238,44 +239,85 @@ def _stable_id(off: Dict[str, Any]) -> str:
     )
 
 
-def _get_cached_results(query: str, page_size: int, refresh_cache: bool = False) -> List[Dict[str, Any]]:
+def _get_cached_results(
+    query: str,
+    page_size: int,
+    page: int,
+    refresh_cache: bool = False,
+) -> List[Dict[str, Any]]:
+    """Retourne la liste complète des résultats pour une requête donnée.
+
+    Seule une portion des pages du site est récupérée en fonction de la page
+    demandée. Les pages supplémentaires sont stockées dans le cache avec le
+    dernier numéro de page consulté afin de reprendre la récupération plus
+    tard sans repartir de la page 1.
+    """
+
+    from concurrent.futures import ThreadPoolExecutor
+
     key = (query, page_size)
     now = time.time()
+
+    acc: List[Dict[str, Any]]
+    last_site_page: int
+
     if not refresh_cache:
         cached = _SEARCH_CACHE.get(key)
-        if cached and now - cached[1] < _CACHE_TTL_SECONDS:
-            return cached[0]
+        if cached and now - cached[2] < _CACHE_TTL_SECONDS:
+            acc = list(cached[0])
+            last_site_page = cached[1]
+        else:
+            acc = []
+            last_site_page = 0
+    else:
+        acc = []
+        last_site_page = 0
 
-    acc: List[Dict[str, Any]] = []
+    needed_items = page * page_size
+
+    while len(acc) < needed_items:
+        missing = needed_items - len(acc)
+        # Nombre de pages du site à récupérer (20 offres / page) + marge
+        to_fetch = ((missing + 19) // 20) + 1
+        pages = list(range(last_site_page + 1, last_site_page + to_fetch + 1))
+        if not pages:
+            break
+
+        fetched = []
+        with ThreadPoolExecutor() as pool:
+            # map conserve l'ordre des pages demandées
+            fetched = list(pool.map(lambda p: (p, _fetch_list_page(query, p)), pages))
+
+        stop = False
+        for p, (items, has_next) in fetched:
+            last_site_page = max(last_site_page, p)
+            acc.extend(items)
+            if not has_next:
+                stop = True
+                break
+        if stop or last_site_page >= 500:
+            break
+
     seen: set[str] = set()
-    current_site_page = 1
-    has_next = True
+    unique: List[Dict[str, Any]] = []
+    for o in acc:
+        k = _stable_id(o)
+        if not k:
+            title = extract_title(o)
+            date = extract_date(o) or ""
+            if title or date:
+                k = hashlib.sha1(f"{title}|{date}".encode("utf-8")).hexdigest()
+            else:
+                k = f"idx-{len(unique)}"
+        if k not in seen:
+            unique.append(o)
+            seen.add(k)
 
-    while has_next:
-        items, has_next = _fetch_list_page(query, current_site_page)
-        current_site_page += 1
-        for o in items:
-            k = _stable_id(o)
-            if not k:
-                title = extract_title(o)
-                date = extract_date(o) or ""
-                if title or date:
-                    k = hashlib.sha1(f"{title}|{date}".encode("utf-8")).hexdigest()
-                else:
-                    k = f"idx-{len(acc)}"
-            if k not in seen:
-                acc.append(o)
-                seen.add(k)
-        if not items:
-            break
-        if current_site_page > 500:
-            break
+    unique.sort(key=_stable_id)
+    unique.sort(key=lambda o: _parse_date_safe(o.get("date")), reverse=True)
 
-    acc.sort(key=_stable_id)
-    acc.sort(key=lambda o: _parse_date_safe(o.get("date")), reverse=True)
-
-    _SEARCH_CACHE[key] = (acc, now)
-    return acc
+    _SEARCH_CACHE[key] = (unique, last_site_page, now)
+    return unique
 
 
 def search_offers(
@@ -311,7 +353,7 @@ def search_offers(
         items, _ = _fetch_list_page(query, page)
         return items
 
-    acc = _get_cached_results(query, page_size, refresh_cache=refresh_cache)
+    acc = _get_cached_results(query, page_size, page, refresh_cache=refresh_cache)
 
     start = max(0, (page - 1) * page_size)
     end = start + page_size
