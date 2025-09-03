@@ -25,11 +25,11 @@ def fmt_date(iso_str: Optional[str]) -> str:
     except Exception:
         return iso_str
 
-def call_api_search(q: Optional[str], page_size: int, page: int) -> Dict[str, Any]:
+def call_api_search(q: Optional[str], n: int) -> Dict[str, Any]:
     """Appelle /search du backend et renvoie le payload JSON."""
     resp = requests.post(
         f"{API_BASE}/search",
-        json={"q": q or None, "page_size": int(page_size), "page": int(page)},
+        json={"q": q or None, "limit": int(n)},
         timeout=30,
     )
     if resp.status_code != 200:
@@ -45,15 +45,11 @@ def call_api_search(q: Optional[str], page_size: int, page: int) -> Dict[str, An
 # -----------------------------
 if "q" not in st.session_state:
     st.session_state.q = "analyste"
-if "page_size" not in st.session_state:
-    st.session_state.page_size = 50
-if "page" not in st.session_state:
-    st.session_state.page = 1
-if "max_page" not in st.session_state:
-    st.session_state.max_page = None
+if "n" not in st.session_state:
+    st.session_state.n = 50
 
 # -----------------------------
-# Formulaire (réinitialise la pagination)
+# Formulaire
 # -----------------------------
 with st.form("search_form"):
     q_in = st.text_input(
@@ -61,47 +57,27 @@ with st.form("search_form"):
         value=st.session_state.q,
         help="Exemples : data scientist, enseignant, juriste, développeur…",
     )
-    page_size_in = st.number_input("Taille de page", min_value=10, max_value=200, value=st.session_state.page_size, step=10)
-    page_in = st.number_input("Page", min_value=1, value=st.session_state.page, step=1)
+    n_in = st.number_input(
+        "Nombre d’offres",
+        min_value=1,
+        max_value=1000,
+        value=st.session_state.n,
+        step=1,
+    )
     submitted = st.form_submit_button("Rechercher")
 
 if submitted:
     st.session_state.q = q_in.strip()
-    st.session_state.page_size = int(page_size_in)
-    st.session_state.page = int(page_in)
+    st.session_state.n = int(n_in)
 
 # -----------------------------
-# Bandeau pagination + total
-# -----------------------------
-c1, c2, c3 = st.columns([1, 2, 1])
-with c1:
-    prev_clicked = st.button("⬅️ Page précédente", disabled=(st.session_state.page <= 1))
-with c3:
-    next_clicked = st.button(
-        "Page suivante ➡️",
-        disabled=(
-            st.session_state.max_page is not None
-            and st.session_state.page >= st.session_state.max_page
-        ),
-    )
-
-if prev_clicked and st.session_state.page > 1:
-    st.session_state.page -= 1
-if next_clicked and (
-    st.session_state.max_page is None
-    or st.session_state.page < st.session_state.max_page
-):
-    st.session_state.page += 1
-
-# -----------------------------
-# Affichage résultats (avec rollback si page vide)
+# Affichage résultats
 # -----------------------------
 def render_results() -> None:
     try:
         payload = call_api_search(
             q=st.session_state.q,
-            page_size=st.session_state.page_size,
-            page=st.session_state.page,
+            n=st.session_state.n,
         )
         items: List[Dict[str, Any]] = payload.get("items", [])
         total_est = payload.get("total_estimated")
@@ -109,30 +85,7 @@ def render_results() -> None:
         if total_est:
             st.caption(f"~{total_est:,} offre(s) au total (estimation)".replace(",", " "))
 
-        # Désactivation du bouton "suivante" si on a un max page estimé
-        max_page = None
-        if total_est and total_est > 0:
-            max_page = (total_est + st.session_state.page_size - 1) // st.session_state.page_size
-
-        st.session_state.max_page = max_page
-        page_txt = str(st.session_state.page)
-        if max_page:
-            page_txt += f"/{max_page}"
-        st.success(f"{len(items)} résultat(s) – page {page_txt}")
-
-        if len(items) == 0 and st.session_state.page > 1:
-            st.info("Aucun résultat sur cette page. Retour à la page précédente.")
-            st.session_state.page -= 1
-            payload = call_api_search(
-                q=st.session_state.q,
-                page_size=st.session_state.page_size,
-                page=st.session_state.page,
-            )
-            items = payload.get("items", [])
-            page_txt = str(st.session_state.page)
-            if st.session_state.max_page:
-                page_txt += f"/{st.session_state.max_page}"
-            st.success(f"{len(items)} résultat(s) – page {page_txt}")
+        st.success(f"{len(items)} résultat(s)")
 
         if not items:
             st.info(
