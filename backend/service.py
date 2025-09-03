@@ -135,10 +135,31 @@ def _fetch_list_page(query: str, page: int) -> Tuple[List[Dict[str, Any]], bool]
     Récupère une page publique (en général 20 offres), parse l’HTML.
     Retourne (offres, has_next)
     """
+    global SESSION
     q = requests.utils.quote(query, safe="")
     url = BASE_LIST.format(q=q) if page <= 1 else PAGE_URL.format(q=q, page=page)
 
-    resp = SESSION.get(url, timeout=30)
+    try:
+        resp = SESSION.get(url, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        # Recreate session with Connection: close on network errors
+        try:
+            SESSION.close()
+        except Exception:
+            pass
+        SESSION = requests.Session()
+        SESSION.headers.update(
+            {
+                "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": f"{SITE}/nos-offres/",
+                "Connection": "close",
+            }
+        )
+        try:
+            resp = SESSION.get(url, timeout=30)
+        except requests.exceptions.RequestException as exc2:
+            raise RuntimeError(f"Erreur réseau lors de la récupération de {url}") from exc2
     if resp.status_code == 404:
         return [], False
     resp.raise_for_status()
