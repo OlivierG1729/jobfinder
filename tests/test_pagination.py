@@ -40,9 +40,9 @@ def test_cache_prevents_refetch(monkeypatch):
 
     monkeypatch.setattr(service, "_fetch_list_page", tracked_fetch)
     page1 = service.search_offers("analyste", page_size=2, page=1)
-    assert calls == [1, 2, 3]
+    assert calls == [1, 2]
     page2 = service.search_offers("analyste", page_size=2, page=2)
-    assert calls == [1, 2, 3]
+    assert calls == [1, 2, 3, 4]
     ids1 = {service.extract_offer_id(o) for o in page1}
     ids2 = {service.extract_offer_id(o) for o in page2}
     assert ids1.isdisjoint(ids2)
