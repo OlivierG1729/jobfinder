@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -39,7 +39,8 @@ app.add_middleware(
 
 class SearchQuery(BaseModel):
     q: Optional[str] = None
-    limit: int = 50
+    # ``limit`` controls the maximum number of offers returned (capped at 1000)
+    limit: int = Field(50, ge=1, le=1000)
 
 
 class SaveSearch(BaseModel):
@@ -79,7 +80,8 @@ def post_search(body: SearchQuery) -> Dict[str, Any]:
                 "raw": o,
             }
         )
-    # pas de total fiable côté site -> on expose seulement la page actuelle
+    # Le site source ne fournit pas de total fiable : on renvoie simplement
+    # les éléments trouvés et la limite utilisée.
     return {"items": result, "limit": body.limit}
 
 

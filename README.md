@@ -19,3 +19,19 @@ Application Python légère pour rechercher les fiches de poste de **choisirlese
    python -m venv .venv
    source .venv/bin/activate  # Windows: .venv\Scripts\activate
    pip install -r requirements.txt
+   ```
+
+3. **Lancer l'API**
+
+   ```bash
+   uvicorn backend.main:app --reload --port 8001
+   ```
+
+## Exemple de recherche
+
+```bash
+curl -X POST http://127.0.0.1:8001/search -H 'Content-Type: application/json' \
+  -d '{"q": "data", "limit": 50}'
+```
+
+Le paramètre `limit` contrôle le nombre d'offres retournées (max 1000).
