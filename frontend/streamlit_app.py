@@ -97,8 +97,22 @@ def render_results() -> None:
             title = it.get("title") or "Offre"
             url = it.get("url") or ""
             date_txt = fmt_date(it.get("date"))
+            org = it.get("organization")
+            logo = it.get("logo")
             with st.container(border=True):
-                st.markdown(f"**{title}**")
+                if logo:
+                    col_logo, col_main = st.columns([1, 5])
+                    with col_logo:
+                        st.image(logo, width=80)
+                    with col_main:
+                        st.markdown(f"**{title}**")
+                        if org:
+                            st.caption(org)
+                else:
+                    st.markdown(f"**{title}**")
+                    if org:
+                        st.caption(org)
+
                 meta_parts = []
                 if date_txt:
                     meta_parts.append(f"📅 {date_txt}")

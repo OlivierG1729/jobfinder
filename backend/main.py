@@ -71,12 +71,16 @@ def post_search(body: SearchQuery) -> Dict[str, Any]:
 
     result = []
     for o in offers:
+        org = o.get("org") if isinstance(o, dict) else None
+        logo = o.get("logo") if isinstance(o, dict) else None
         result.append(
             {
                 "id": extract_offer_id(o) if isinstance(o, dict) else None,
                 "title": extract_title(o) if isinstance(o, dict) else "",
                 "date": extract_date(o) if isinstance(o, dict) else None,
                 "url": extract_url(o) if isinstance(o, dict) else None,
+                "organization": org,
+                "logo": logo,
                 "raw": o,
             }
         )

@@ -192,12 +192,24 @@ def _fetch_list_page(query: str, page: int) -> Tuple[List[Dict[str, Any]], bool]
                 break
         iso_date = _parse_date_fr(date_text) if date_text else None
 
+        org_name = None
+        detail = card.select_one(".fr-card__detail")
+        if detail:
+            org_name = detail.get_text(strip=True)
+
+        logo_url = None
+        img = card.select_one("img")
+        if img and img.get("src"):
+            logo_url = _to_absolute(img.get("src"))
+
         results.append(
             {
                 "id": oid,
                 "title": title,
                 "date": iso_date,          # ISO (YYYY-MM-DD) ou None
                 "url": href,               # URL absolue
+                "org": org_name,
+                "logo": logo_url,
             }
         )
 
