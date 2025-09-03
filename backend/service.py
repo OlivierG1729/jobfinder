@@ -19,6 +19,8 @@ import unicodedata
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 SITE = "https://choisirleservicepublic.gouv.fr"
 BASE_LIST = f"{SITE}/nos-offres/filtres/mot-cles/{{q}}/"
@@ -30,15 +32,6 @@ FR_MONTHS = {
     "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
     "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
 }
-
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": f"{SITE}/nos-offres/",
-    }
-)
 
 # Cache des résultats : clé query -> (résultats cumulés, dernière page récupérée, timestamp)
 _CACHE_TTL_SECONDS = 3600  # 1h par défaut
@@ -157,31 +150,25 @@ def _fetch_list_page(query: str, page: int) -> Tuple[List[Dict[str, Any]], bool]
     Récupère une page publique (en général 20 offres), parse l’HTML.
     Retourne (offres, has_next)
     """
-    global SESSION
     q = _slugify(query)
     url = BASE_LIST.format(q=q) if page <= 1 else PAGE_URL.format(q=q, page=page)
 
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1))
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": f"{SITE}/nos-offres/",
+        }
+    )
+
     try:
-        resp = SESSION.get(url, timeout=30)
+        resp = session.get(url, timeout=10)
     except requests.exceptions.RequestException as exc:
-        # Recreate session with Connection: close on network errors
-        try:
-            SESSION.close()
-        except Exception:
-            pass
-        SESSION = requests.Session()
-        SESSION.headers.update(
-            {
-                "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": f"{SITE}/nos-offres/",
-                "Connection": "close",
-            }
-        )
-        try:
-            resp = SESSION.get(url, timeout=30)
-        except requests.exceptions.RequestException as exc2:
-            raise RuntimeError(f"Erreur réseau lors de la récupération de {url}") from exc2
+        raise RuntimeError(f"Page {page} inaccessible") from exc
     if resp.status_code == 404:
         return [], False
     resp.raise_for_status()
@@ -309,17 +296,21 @@ def _get_cached_results(
         if not pages:
             break
 
-        fetched = []
-        with ThreadPoolExecutor() as pool:
-            # map conserve l'ordre des pages demandées
-            fetched = list(pool.map(lambda p: (p, _fetch_list_page(query, p)), pages))
-
         stop = False
-        for p, (items, has_next) in fetched:
-            last_site_page = max(last_site_page, p)
-            acc.extend(items)
-            if not has_next:
-                stop = True
+        for i in range(0, len(pages), 5):
+            chunk = pages[i : i + 5]
+            fetched = []
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                # map conserve l'ordre des pages demandées
+                fetched = list(pool.map(lambda p: (p, _fetch_list_page(query, p)), chunk))
+
+            for p, (items, has_next) in fetched:
+                last_site_page = max(last_site_page, p)
+                acc.extend(items)
+                if not has_next:
+                    stop = True
+                    break
+            if stop:
                 break
         if stop or last_site_page >= 500:
             break
