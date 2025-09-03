@@ -216,6 +216,7 @@ def search_offers(
     query: Optional[str] = None,
     page_size: int = 50,
     page: int = 1,
+    fast_mode: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Pagination user-friendly & STABLE :
@@ -229,11 +230,19 @@ def search_offers(
     - on dédoublonne,
     - on trie : date DESC puis stable_id ASC (ordre stable pour les dates identiques),
     - on découpe par offset (start/end).
+
+    fast_mode:
+      Si True, on ne récupère que la page demandée sur le site et on
+      retourne la liste telle quelle (page_size ignoré). Cela supprime la
+      garantie de pagination stable.
     """
     if not query or not query.strip():
         return []
 
     query = query.strip()
+    if fast_mode:
+        items, _ = _fetch_list_page(query, page)
+        return items
     need = page * page_size  # combien d'items au total à avoir avant de trancher
     acc: List[Dict[str, Any]] = []
     seen: set[str] = set()
