@@ -49,6 +49,8 @@ if "page_size" not in st.session_state:
     st.session_state.page_size = 50
 if "page" not in st.session_state:
     st.session_state.page = 1
+if "max_page" not in st.session_state:
+    st.session_state.max_page = None
 
 # -----------------------------
 # Formulaire (réinitialise la pagination)
@@ -60,12 +62,13 @@ with st.form("search_form"):
         help="Exemples : data scientist, enseignant, juriste, développeur…",
     )
     page_size_in = st.number_input("Taille de page", min_value=10, max_value=200, value=st.session_state.page_size, step=10)
+    page_in = st.number_input("Page", min_value=1, value=st.session_state.page, step=1)
     submitted = st.form_submit_button("Rechercher")
 
 if submitted:
     st.session_state.q = q_in.strip()
     st.session_state.page_size = int(page_size_in)
-    st.session_state.page = 1  # reset pagination
+    st.session_state.page = int(page_in)
 
 # -----------------------------
 # Bandeau pagination + total
@@ -74,11 +77,20 @@ c1, c2, c3 = st.columns([1, 2, 1])
 with c1:
     prev_clicked = st.button("⬅️ Page précédente", disabled=(st.session_state.page <= 1))
 with c3:
-    next_clicked = st.button("Page suivante ➡️")
+    next_clicked = st.button(
+        "Page suivante ➡️",
+        disabled=(
+            st.session_state.max_page is not None
+            and st.session_state.page >= st.session_state.max_page
+        ),
+    )
 
 if prev_clicked and st.session_state.page > 1:
     st.session_state.page -= 1
-if next_clicked:
+if next_clicked and (
+    st.session_state.max_page is None
+    or st.session_state.page < st.session_state.max_page
+):
     st.session_state.page += 1
 
 # -----------------------------
@@ -102,7 +114,11 @@ def render_results() -> None:
         if total_est and total_est > 0:
             max_page = (total_est + st.session_state.page_size - 1) // st.session_state.page_size
 
-        st.success(f"{len(items)} résultat(s) – page {st.session_state.page}")
+        st.session_state.max_page = max_page
+        page_txt = str(st.session_state.page)
+        if max_page:
+            page_txt += f"/{max_page}"
+        st.success(f"{len(items)} résultat(s) – page {page_txt}")
 
         if len(items) == 0 and st.session_state.page > 1:
             st.info("Aucun résultat sur cette page. Retour à la page précédente.")
@@ -113,7 +129,10 @@ def render_results() -> None:
                 page=st.session_state.page,
             )
             items = payload.get("items", [])
-            st.success(f"{len(items)} résultat(s) – page {st.session_state.page}")
+            page_txt = str(st.session_state.page)
+            if st.session_state.max_page:
+                page_txt += f"/{st.session_state.max_page}"
+            st.success(f"{len(items)} résultat(s) – page {page_txt}")
 
         if not items:
             st.info(
