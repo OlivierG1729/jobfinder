@@ -87,7 +87,7 @@ def _fetch_api_page(query: str, page: int, per_page: int) -> List[Dict[str, Any]
     session.mount("https://", adapter)
     session.headers.update(
         {
-            "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
+            "User-Agent": "Mozilla/5.0",
             "Accept": "application/json",
         }
     )
