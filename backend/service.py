@@ -13,12 +13,14 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import hashlib
 import time
+import json
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-API_URL = "https://choisirleservicepublic.gouv.fr/api/offres"
+API_URL = "https://choisirleservicepublic.gouv.fr/wp-admin/admin-ajax.php"
+API_ACTION = "get_offers"
 
 # Cache des résultats : clé query -> (résultats cumulés, dernière page récupérée, timestamp)
 _CACHE_TTL_SECONDS = 3600  # 1h par défaut
@@ -91,19 +93,25 @@ def _fetch_api_page(query: str, page: int, per_page: int) -> List[Dict[str, Any]
             "Accept": "application/json",
         }
     )
-    params = {"q": query, "page": page, "limit": per_page}
+    payload = {
+        "action": API_ACTION,
+        "query": query,
+        "page": page,
+        "limit": per_page,
+        "filters": json.dumps({}),
+    }
     try:
-        resp = session.get(API_URL, params=params, timeout=10)
+        resp = session.post(API_URL, data=payload, timeout=10)
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(f"Page API {page} inaccessible") from exc
     if resp.status_code == 404:
         return []
     resp.raise_for_status()
     try:
-        data = resp.json()
+        payload = resp.json()
     except ValueError as exc:
         raise RuntimeError(f"Réponse non‑JSON reçue : {resp.text[:200]!r}") from exc
-    items = data.get("items") or data.get("results") or []
+    items = payload.get("items") or payload.get("results") or payload.get("offers") or []
     if not isinstance(items, list):
         return []
     return items
