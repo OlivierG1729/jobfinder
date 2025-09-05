@@ -27,6 +27,7 @@ _SEARCH_CACHE: Dict[str, tuple[List[Dict[str, Any]], int, float]] = {}
 
 # --------- Helpers d'extraction (API interne du backend) ---------
 
+
 def extract_offer_id(off: Dict[str, Any]) -> Optional[str]:
     """Essaye d'extraire un identifiant stable ; sinon None."""
     oid = off.get("id")
@@ -78,13 +79,17 @@ def extract_url(off: Dict[str, Any]) -> Optional[str]:
 
 # --------- Appel de l'API publique ---------
 
+
 def _fetch_api_page(query: str, page: int, per_page: int) -> List[Dict[str, Any]]:
     session = requests.Session()
     adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1))
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update(
-        {"User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)"}
+        {
+            "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
+            "Accept": "application/json",
+        }
     )
     params = {"q": query, "page": page, "limit": per_page}
     try:
@@ -94,7 +99,10 @@ def _fetch_api_page(query: str, page: int, per_page: int) -> List[Dict[str, Any]
     if resp.status_code == 404:
         return []
     resp.raise_for_status()
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Réponse non‑JSON reçue : {resp.text[:200]!r}") from exc
     items = data.get("items") or data.get("results") or []
     if not isinstance(items, list):
         return []
@@ -102,6 +110,7 @@ def _fetch_api_page(query: str, page: int, per_page: int) -> List[Dict[str, Any]
 
 
 # --------- Tri/pagination stables ---------
+
 
 def _parse_date_safe(s: Optional[str]) -> datetime:
     """Robuste : ISO 'YYYY-MM-DD' -> datetime ; sinon datetime.min."""
@@ -121,11 +130,11 @@ def _parse_date_safe(s: Optional[str]) -> datetime:
 def _stable_id(off: Dict[str, Any]) -> str:
     """Identifiant déterministe pour tie-break + dédoublonnage."""
     return (
-        (off.get("id") and str(off["id"])) or
-        (off.get("_id") and str(off["_id"])) or
-        (off.get("offer_id") and str(off["offer_id"])) or
-        (off.get("url") or "") or
-        (off.get("title") or off.get("intitule") or "")
+        (off.get("id") and str(off["id"]))
+        or (off.get("_id") and str(off["_id"]))
+        or (off.get("offer_id") and str(off["offer_id"]))
+        or (off.get("url") or "")
+        or (off.get("title") or off.get("intitule") or "")
     )
 
 
