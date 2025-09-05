@@ -1,37 +1,24 @@
 # backend/service.py
 """
-Recherche CSP en parsant les pages publiques (fiable et sans nonce).
+Recherche d'offres CSP via l'API publique.
 Objectifs :
-- Toujours trier par date décroissante (plus récent -> plus ancien).
-- Limiter le nombre de résultats via un paramètre ``limit``.
-- Dédoublonnage (au cas où une offre apparaisse sur plusieurs pages côté site).
+ - Toujours trier par date décroissante (plus récent -> plus ancien).
+ - Limiter le nombre de résultats via un paramètre ``limit``.
+ - Dédoublonnage (au cas où une offre apparaisse sur plusieurs pages côté site).
 """
 
 from __future__ import annotations
 
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from datetime import datetime
-import html as _html
-import re
 import hashlib
 import time
-import unicodedata
 
 import requests
-from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-SITE = "https://choisirleservicepublic.gouv.fr"
-BASE_LIST = f"{SITE}/nos-offres/filtres/mot-cles/{{q}}/"
-PAGE_URL = f"{SITE}/nos-offres/filtres/mot-cles/{{q}}/page/{{page}}/"
-
-# Mois français -> numéro
-FR_MONTHS = {
-    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4,
-    "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
-    "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
-}
+API_URL = "https://choisirleservicepublic.gouv.fr/api/offres"
 
 # Cache des résultats : clé query -> (résultats cumulés, dernière page récupérée, timestamp)
 _CACHE_TTL_SECONDS = 3600  # 1h par défaut
@@ -89,141 +76,29 @@ def extract_url(off: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-# --------- Parsing des pages publiques ---------
+# --------- Appel de l'API publique ---------
 
-def _to_absolute(url: str) -> str:
-    if url.startswith("http://") or url.startswith("https://"):
-        return url
-    if url.startswith("/"):
-        return SITE + url
-    return f"{SITE}/{url.lstrip('/')}"
-
-
-def _parse_date_fr(text: str) -> Optional[str]:
-    """
-    Exemple de texte : 'En ligne depuis le 06 août 2025'
-    Retourne ISO '2025-08-06' si possible.
-    """
-    if not text:
-        return None
-    t = text.strip().lower()
-    # tolérer accents/variantes
-    t = (
-        t.replace("é", "e").replace("è", "e").replace("ê", "e")
-         .replace("à", "a").replace("â", "a").replace("ô", "o")
-         .replace("û", "u").replace("ï", "i").replace("î", "i")
-         .replace("ç", "c").replace("œ", "oe")
-    )
-    m = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", t)
-    if not m:
-        return None
-    day = int(m.group(1))
-    month_name = m.group(2)
-    year = int(m.group(3))
-    month = FR_MONTHS.get(month_name)
-    if not month:
-        return None
-    try:
-        return datetime(year, month, day).date().isoformat()
-    except Exception:
-        return None
-
-
-_SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
-
-def _slugify(q: str) -> str:
-    """Génère un slug ASCII pour les requêtes de recherche."""
-    if not q:
-        return ""
-    # Normaliser et supprimer les accents
-    q = unicodedata.normalize("NFKD", q)
-    q = q.encode("ascii", "ignore").decode("ascii")
-    # Remplacer les caractères non alphanumériques par des '-'
-    q = _SLUG_RE.sub("-", q)
-    # Réduire les tirets consécutifs et convertir en minuscules
-    q = re.sub("-+", "-", q).strip("-")
-    return q.lower()
-
-
-def _fetch_list_page(query: str, page: int) -> Tuple[List[Dict[str, Any]], bool]:
-    """
-    Récupère une page publique (en général 20 offres), parse l’HTML.
-    Retourne (offres, has_next)
-    """
-    q = _slugify(query)
-    url = BASE_LIST.format(q=q) if page <= 1 else PAGE_URL.format(q=q, page=page)
-
+def _fetch_api_page(query: str, page: int, per_page: int) -> List[Dict[str, Any]]:
     session = requests.Session()
     adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1))
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update(
-        {
-            "User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": f"{SITE}/nos-offres/",
-        }
+        {"User-Agent": "JobFinder/1.0 (+https://github.com/OlivierG1729/jobfinder)"}
     )
-
+    params = {"q": query, "page": page, "limit": per_page}
     try:
-        resp = session.get(url, timeout=10)
+        resp = session.get(API_URL, params=params, timeout=10)
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Page {page} inaccessible") from exc
+        raise RuntimeError(f"Page API {page} inaccessible") from exc
     if resp.status_code == 404:
-        return [], False
+        return []
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    results: List[Dict[str, Any]] = []
-
-    # chaque carte offre
-    for card in soup.select(".fr-card.fr-card--offer"):
-        a = card.select_one("h3.fr-card__title a")
-        if not a or not a.get("href"):
-            continue
-        title = _html.unescape(a.get_text(strip=True))
-        href = _to_absolute(a["href"].strip())
-
-        # tentative d'id depuis l'URL
-        oid = href.rstrip("/").split("/")[-1]
-
-        # date : chercher l’élément qui contient "En ligne depuis le ..."
-        date_text = ""
-        for li in card.select("ul.fr-card__desc li"):
-            t = li.get_text(" ", strip=True)
-            if "en ligne depuis" in t.lower():
-                date_text = t
-                break
-        iso_date = _parse_date_fr(date_text) if date_text else None
-
-        org_name = None
-        detail = card.select_one(".fr-card__detail")
-        if detail:
-            org_name = detail.get_text(strip=True)
-
-        logo_url = None
-        img = card.select_one("img")
-        if img and img.get("src"):
-            logo_url = _to_absolute(img.get("src"))
-
-        results.append(
-            {
-                "id": oid,
-                "title": title,
-                "date": iso_date,          # ISO (YYYY-MM-DD) ou None
-                "url": href,               # URL absolue
-                "org": org_name,
-                "logo": logo_url,
-            }
-        )
-
-    # pagination : bouton "Suivant" présent ?
-    has_next = False
-    next_link = soup.select_one(".fr-pagination__link--next[href]")
-    if next_link and next_link.get("href"):
-        has_next = True
-
-    return results, has_next
+    data = resp.json()
+    items = data.get("items") or data.get("results") or []
+    if not isinstance(items, list):
+        return []
+    return items
 
 
 # --------- Tri/pagination stables ---------
@@ -297,17 +172,20 @@ def _get_cached_results(
             break
 
         stop = False
+        per_page = 20
         for i in range(0, len(pages), 5):
             chunk = pages[i : i + 5]
             fetched = []
             with ThreadPoolExecutor(max_workers=5) as pool:
                 # map conserve l'ordre des pages demandées
-                fetched = list(pool.map(lambda p: (p, _fetch_list_page(query, p)), chunk))
+                fetched = list(
+                    pool.map(lambda p: (p, _fetch_api_page(query, p, per_page)), chunk)
+                )
 
-            for p, (items, has_next) in fetched:
+            for p, items in fetched:
                 last_site_page = max(last_site_page, p)
                 acc.extend(items)
-                if not has_next:
+                if len(items) < per_page:
                     stop = True
                     break
             if stop:
@@ -349,8 +227,7 @@ def search_offers(
 
     query = query.strip()
     if fast_mode:
-        items, _ = _fetch_list_page(query, 1)
-        return items
+        return _fetch_api_page(query, 1, limit)
 
     acc = _get_cached_results(query, limit, refresh_cache=refresh_cache)
 
